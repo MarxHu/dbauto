@@ -16,6 +16,7 @@ CLUSTER_BUS_PORT="${CLUSTER_BUS_PORT:-16379}"
 TARGET_HOST="${TARGET_HOST:-}"
 FAULT_DURATION_SEC="${FAULT_DURATION_SEC:-240}"
 SSH_USER="${SSH_USER:-root}"
+REDIS_DATA_DIR="${REDIS_DATA_DIR:-/var/lib/redis}"
 STATE_DIR="${ROOT_DIR}/.state"
 
 mkdir -p "${STATE_DIR}"
@@ -30,8 +31,7 @@ die() {
 }
 
 require_cmd() {
-  local cmd="$1"
-  command -v "${cmd}" >/dev/null 2>&1 || die "missing command: ${cmd}"
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
 
 run_on_target() {
@@ -60,72 +60,40 @@ first_node() {
   echo "${REDIS_NODES%% *}"
 }
 
-state_file() {
-  echo "${STATE_DIR}/$1"
+parse_duration() {
+  DURATION="${DURATION:-${FAULT_DURATION_SEC}}"
+  [[ "${DURATION}" =~ ^[0-9]+$ ]] || die "--duration must be a positive integer (seconds)"
 }
 
-save_state() {
-  local name="$1"
-  local value="$2"
-  printf '%s' "${value}" > "$(state_file "${name}")"
-}
-
-load_state() {
-  local name="$1"
-  local default="${2:-}"
-  local file
-  file="$(state_file "${name}")"
-  if [[ -f "${file}" ]]; then
-    cat "${file}"
-  else
-    printf '%s' "${default}"
-  fi
-}
-
-usage_duration() {
+usage_header() {
   cat <<EOF
-Duration:
-  Sustained faults for AI diagnosis should run about ${FAULT_DURATION_SEC}s (>=240s recommended).
-  Override with: DURATION=<seconds> $0
+Usage: $0 --action <name> [options]
+
+Common options:
+  --duration <sec>       Fault active time, auto-recover after expiry (default: ${FAULT_DURATION_SEC})
+  --target-host <ip>     Run host-level fault on this VM via SSH (default: local)
+  --node <ip:port>       Redis endpoint (default: first node in config)
+  -h, --help             Show help
+
+All faults auto-recover when duration elapses. No separate recover command.
 EOF
 }
 
-parse_duration() {
-  DURATION="${DURATION:-${FAULT_DURATION_SEC}}"
-  [[ "${DURATION}" =~ ^[0-9]+$ ]] || die "DURATION must be an integer second value"
+run_timed_fault() {
+  local duration="$1"
+  local cleanup_fn="$2"
+  trap "${cleanup_fn}" EXIT INT TERM
+  log "fault active for ${duration}s, will auto-recover"
+  sleep "${duration}"
+  "${cleanup_fn}"
+  trap - EXIT INT TERM
+  log "auto-recovered"
 }
 
-background_pid_file() {
-  echo "${STATE_DIR}/$1.pid"
+require_action() {
+  [[ -n "${ACTION:-}" ]] || die "missing --action"
 }
 
-start_background() {
-  local name="$1"
-  shift
-  local pid_file
-  pid_file="$(background_pid_file "${name}")"
-  if [[ -f "${pid_file}" ]] && kill -0 "$(cat "${pid_file}")" 2>/dev/null; then
-    die "${name} already running (pid $(cat "${pid_file}"))"
-  fi
-  nohup "$@" >/dev/null 2>&1 &
-  echo $! > "${pid_file}"
-  log "started ${name}, pid=$(cat "${pid_file}")"
-}
-
-stop_background() {
-  local name="$1"
-  local pid_file
-  pid_file="$(background_pid_file "${name}")"
-  if [[ -f "${pid_file}" ]]; then
-    local pid
-    pid="$(cat "${pid_file}")"
-    if kill -0 "${pid}" 2>/dev/null; then
-      kill "${pid}" 2>/dev/null || true
-      wait "${pid}" 2>/dev/null || true
-      log "stopped ${name}, pid=${pid}"
-    fi
-    rm -f "${pid_file}"
-  else
-    log "${name} not running"
-  fi
+resolve_node() {
+  NODE="${NODE:-$(first_node)}"
 }
