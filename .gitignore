@@ -1,1 +1,4 @@
+
 redis_fault_injection/config.env
+# redis fault injection runtime
+redis_fault_injection/.state/
