@@ -185,8 +185,23 @@ echo "redis-injector-node image OK"
 
 ---
 
-## 7. 变更记录
+## 7. Bake 与部署编译的关系（重要）
+
+| 阶段 | 做什么 | 结果 |
+|------|--------|------|
+| **镜像 bake** | 验证节点能编过 Redis，然后**卸掉** `redis-server` | 空机无二进制，仅保留工具链 |
+| **SOPS 部署** | 再下载 tar.gz，在节点上**重新编译安装** | 必须产出 `/opt/redis/<ver>/bin/redis-server` |
+
+因此：
+
+- Docker 规范验收通过 ≠ 集群已就绪  
+- bake 时 `make -j8` 成功 ≠ 部署 YAML 里同一条裸 `make -j` 一定成功  
+- 部署脚本必须：**干净解压 → `make -C deps jemalloc ...` → 生成 `src/release.h` → 再编主程序**  
+- 若部署仍报 `release.h` / `je_*` 隐式声明：属**部署编译步骤不合格**，不是「Docker 又坏了」
+
+## 8. 变更记录
 
 | 日期 | 说明 |
 |------|------|
 | 2026-08-31 | 首版：融合数据节点压测/网络工具、jemalloc 编译要求、注入机 redis-cli/flock/bash≥4 |
+| 2026-08-31 | 补充 bake 与 SOPS 部署编译分离说明；部署须 deps-first + 显式 mkreleasehdr |

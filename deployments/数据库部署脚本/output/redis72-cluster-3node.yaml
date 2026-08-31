@@ -321,11 +321,30 @@ spec:
             [[ -n "$tarball_sha256" ]] || error "未配置 tar.gz SHA256"
             echo "${tarball_sha256}  ${tarball}" | sha256sum -c -
 
+            # 干净树重编：镜像 bake 编过并卸载，不等于部署时可跳过编译。
+            # 禁止裸 make -j（易出现 release.h 未生成 / bundled jemalloc 未就绪）。
             rm -rf "redis-${redis_version}"
             tar -xzf "$tarball"
             cd "redis-${redis_version}"
-            make -j"${parallel}" BUILD_TLS=no
+            chmod +x src/mkreleasehdr.sh deps/jemalloc/configure 2>/dev/null || true
+
+            info "先编译 deps（jemalloc/hiredis/linenoise/lua）"
+            make -C deps jemalloc hiredis linenoise lua
+
+            info "生成 release.h 后再编主程序"
+            ( cd src && sh ./mkreleasehdr.sh )
+            [[ -f src/release.h ]] || error "mkreleasehdr.sh 未生成 src/release.h"
+
+            if ! make -j"${parallel}" BUILD_TLS=no; then
+              info "并行编译失败，降级 make -j1 重试"
+              make distclean || true
+              make -C deps jemalloc hiredis linenoise lua
+              ( cd src && sh ./mkreleasehdr.sh )
+              make -j1 BUILD_TLS=no
+            fi
+
             make PREFIX="${install_prefix}" install
+            [[ -x "${install_prefix}/bin/redis-server" ]] || error "install 后缺少 redis-server"
             "${install_prefix}/bin/redis-server" --version
             info "二进制安装完成: ${install_prefix}"
         job_ip_list:
