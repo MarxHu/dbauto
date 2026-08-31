@@ -1,0 +1,197 @@
+# Redis 7.2 一主两从 + Sentinel（3 节点）部署流程
+# 拓扑：172.30.0.11 主库，172.30.0.12/13 从库；每节点运行 redis-server + redis-sentinel
+# 保护：从库 replica-read-only、requirepass/masterauth、Sentinel 自动故障转移
+
+apiVersion: dbauto/v1
+kind: RedisClusterDeployment
+metadata:
+  name: redis72-primary-replicas-3node
+  redis_version: "7.2"
+  topology: primary-replicas-sentinel
+
+parameters:
+  redis_password:
+    description: Redis 认证密码（requirepass / masterauth）
+    required: true
+  sentinel_password:
+    description: Sentinel 认证密码（可选，留空则不启用 sentinel auth）
+    default: ""
+  master_name:
+    description: Sentinel 监控的主节点逻辑名
+    default: mymaster
+  sentinel_quorum:
+    description: 判定主库客观下线所需 Sentinel 票数
+    default: 2
+  sentinel_down_after_ms:
+    description: 主库无响应多少毫秒后标记为主观下线
+    default: 5000
+  sentinel_failover_timeout_ms:
+    description: 故障转移超时（毫秒）
+    default: 60000
+  redis_port:
+    description: Redis 服务端口
+    default: 6379
+  sentinel_port:
+    description: Sentinel 服务端口
+    default: 26379
+
+hosts:
+  - ip: 172.30.0.11
+    role: primary
+  - ip: 172.30.0.12
+    role: replica
+  - ip: 172.30.0.13
+    role: replica
+
+phases:
+  - name: 环境预检
+    steps:
+      - action: check_port_available
+        ports:
+          - "{{ params.redis_port }}"
+          - "{{ params.sentinel_port }}"
+      - action: check_conflicting_packages
+        packages:
+          - redis
+          - remi-release
+        policy: warn_or_remove_orphans
+      - action: check_ulimit
+        expect:
+          nofile_min: 65535
+
+  - name: 安装RPM
+    steps:
+      - action: install_redis_rpm
+        version: "7.2"
+        enable_epel_or_remi: true
+
+  - name: 角色配置持久化
+    description: 写入 redis.conf / sentinel.conf，重启后配置不丢失
+    steps:
+      - action: configure_redis
+        file: /etc/redis/redis.conf
+        content: |
+          bind 0.0.0.0
+          port {{ params.redis_port }}
+          protected-mode yes
+          daemonize no
+          supervised systemd
+          pidfile /var/run/redis_{{ params.redis_port }}.pid
+          logfile /var/log/redis/redis.log
+          dir /var/lib/redis
+          appendonly yes
+          appendfsync everysec
+          requirepass {{ params.redis_password }}
+          masterauth {{ params.redis_password }}
+          replica-read-only yes
+          replica-serve-stale-data yes
+          repl-diskless-sync no
+          maxmemory-policy noeviction
+          tcp-keepalive 300
+          timeout 0
+
+      - action: configure_redis
+        when: "host.role == 'replica'"
+        file: /etc/redis/redis.conf
+        append: |
+          # 从库指向主库
+          replicaof 172.30.0.11 {{ params.redis_port }}
+
+      - action: configure_sentinel
+        file: /etc/redis/sentinel.conf
+        content: |
+          bind 0.0.0.0
+          port {{ params.sentinel_port }}
+          daemonize no
+          supervised systemd
+          logfile /var/log/redis/sentinel.log
+          dir /var/lib/redis
+          sentinel monitor {{ params.master_name }} 172.30.0.11 {{ params.redis_port }} {{ params.sentinel_quorum }}
+          sentinel down-after-milliseconds {{ params.master_name }} {{ params.sentinel_down_after_ms }}
+          sentinel parallel-syncs {{ params.master_name }} 1
+          sentinel failover-timeout {{ params.master_name }} {{ params.sentinel_failover_timeout_ms }}
+
+      - action: configure_sentinel
+        when: "params.sentinel_password != ''"
+        file: /etc/redis/sentinel.conf
+        append: |
+          requirepass {{ params.sentinel_password }}
+          sentinel auth-pass {{ params.master_name }} {{ params.redis_password }}
+
+  - name: 启动服务
+    steps:
+      - action: start_service
+        service: redis
+      - action: start_service
+        service: redis-sentinel
+
+  - name: 主从复制就绪
+    description: 从库建立复制链路并确认只读
+    when: "host.role == 'replica'"
+    auth:
+      password: "{{ params.redis_password }}"
+    commands:
+      - run: redis-cli -a '{{ params.redis_password }}' REPLICAOF 172.30.0.11 {{ params.redis_port }}
+        comment: 运行时确认复制指向（与 redis.conf 双保险）
+      - run: redis-cli -a '{{ params.redis_password }}' CONFIG SET replica-read-only yes
+
+  - name: 拓扑保护加固
+    description: 确认 Sentinel 已监控主库，从库不可写
+    steps:
+      - action: wait_replication
+        when: "host.role == 'replica'"
+        auth:
+          password: "{{ params.redis_password }}"
+        expect:
+          role: slave
+          master_link_status: up
+          master_host: 172.30.0.11
+
+      - action: wait_sentinel
+        when: "host.role == 'primary'"
+        auth:
+          password: "{{ params.sentinel_password | default('') }}"
+        expect:
+          master_name: "{{ params.master_name }}"
+          num_slaves: 2
+          num_sentinels: 3
+          master_host: 172.30.0.11
+
+  - name: 部署验收
+    steps:
+      - action: assert_redis
+        when: "host.role == 'primary'"
+        auth:
+          password: "{{ params.redis_password }}"
+        checks:
+          - command: "INFO replication"
+            expect_fields:
+              role: master
+              connected_slaves: "2"
+          - command: "SET __deploy_verify__ 1"
+            expect: OK
+
+      - action: assert_redis
+        when: "host.role == 'replica'"
+        auth:
+          password: "{{ params.redis_password }}"
+        checks:
+          - command: "INFO replication"
+            expect_fields:
+              role: slave
+              master_host: 172.30.0.11
+              master_link_status: up
+              slave_read_only: "1"
+          - command: "SET __deploy_verify__ 1"
+            expect_error: READONLY
+            comment: 从库应拒绝写入
+
+      - action: assert_sentinel
+        on_hosts: all
+        checks:
+          - command: "SENTINEL master {{ params.master_name }}"
+            expect_fields:
+              ip: 172.30.0.11
+              flags: master
+          - command: "SENTINEL slaves {{ params.master_name }}"
+            expect_count: 2
