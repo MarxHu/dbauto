@@ -52,6 +52,8 @@ done
 
 require_action
 
+acquire_inject_lock
+
 case "${ACTION}" in
   persistence-fail)
     parse_duration

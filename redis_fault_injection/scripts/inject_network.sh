@@ -75,6 +75,8 @@ done
 
 require_action
 
+acquire_inject_lock
+
 case "${ACTION}" in
   bus-block)
     parse_duration

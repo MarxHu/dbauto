@@ -14,10 +14,11 @@ REDIS_PASSWORD="${REDIS_PASSWORD:-}"
 REDIS_CLI="${REDIS_CLI:-redis-cli}"
 CLUSTER_BUS_PORT="${CLUSTER_BUS_PORT:-16379}"
 TARGET_HOST="${TARGET_HOST:-}"
-FAULT_DURATION_SEC="${FAULT_DURATION_SEC:-240}"
+FAULT_DURATION_SEC="${FAULT_DURATION_SEC:-600}"
 SSH_USER="${SSH_USER:-root}"
 REDIS_DATA_DIR="${REDIS_DATA_DIR:-/var/lib/redis}"
 STATE_DIR="${ROOT_DIR}/.state"
+INJECT_LOCK_FILE="${STATE_DIR}/inject.lock"
 
 mkdir -p "${STATE_DIR}"
 
@@ -32,6 +33,15 @@ die() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+acquire_inject_lock() {
+  [[ "${INJECT_LOCK_SKIP:-}" == "1" ]] && return 0
+  exec 200>"${INJECT_LOCK_FILE}"
+  if ! flock -n 200; then
+    die "another injection is active (${INJECT_LOCK_FILE}); wait until it auto-recovers"
+  fi
+  log "acquired injection lock"
 }
 
 run_on_target() {
@@ -56,6 +66,19 @@ redis_cmd() {
   fi
 }
 
+redis_cmd_nocluster() {
+  local addr="$1"
+  shift
+  local host port
+  host="${addr%%:*}"
+  port="${addr##*:}"
+  if [[ -n "${REDIS_PASSWORD}" ]]; then
+    "${REDIS_CLI}" --no-auth-warning -h "${host}" -p "${port}" -a "${REDIS_PASSWORD}" "$@"
+  else
+    "${REDIS_CLI}" --no-auth-warning -h "${host}" -p "${port}" "$@"
+  fi
+}
+
 first_node() {
   echo "${REDIS_NODES%% *}"
 }
@@ -71,11 +94,11 @@ Usage: $0 --action <name> [options]
 
 Common options:
   --duration <sec>       Fault active time, auto-recover after expiry (default: ${FAULT_DURATION_SEC})
-  --target-host <ip>     Run host-level fault on this VM via SSH (default: local)
+  --target-host <ip>     Optional remote host via SSH (default: local machine)
   --node <ip:port>       Redis endpoint (default: first node in config)
   -h, --help             Show help
 
-All faults auto-recover when duration elapses. No separate recover command.
+Injection bot runs one action at a time; lock file: ${INJECT_LOCK_FILE}
 EOF
 }
 

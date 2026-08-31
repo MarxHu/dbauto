@@ -129,6 +129,8 @@ resolve_node
 host="${NODE%%:*}"
 port="${NODE##*:}"
 
+acquire_inject_lock
+
 case "${ACTION}" in
   process-stop)
     parse_duration
@@ -249,32 +251,49 @@ case "${ACTION}" in
     ;;
   error-pulse)
     parse_duration
-    pulse_cmd=""
-    case "${ERROR_TYPE}" in
-      NOAUTH) pulse_cmd="redis-cli -h ${host} -p ${port} -a wrong_password PING >/dev/null 2>&1 || true" ;;
-      WRONGPASS) pulse_cmd="redis-cli -h ${host} -p ${port} --user default --pass wrong PING >/dev/null 2>&1 || true" ;;
-      MOVED) pulse_cmd="redis-cli -h ${host} -p ${port} SET moved:key value >/dev/null 2>&1 || true" ;;
-      CROSSSLOT) pulse_cmd="redis-cli -h ${host} -p ${port} MGET '{a}:1' '{b}:2' >/dev/null 2>&1 || true" ;;
-      *) die "unsupported --error-type ${ERROR_TYPE}" ;;
-    esac
+    log "error pulse ${ERROR_TYPE} on ${NODE}; bounded ${PULSE_INTERVAL}s x ${PULSE_MAX}"
+    baseline="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep -E 'NOAUTH|WRONGPASS|MISCONF|MOVED|CROSSSLOT' || true)"
+    [[ -n "${baseline}" ]] && log "baseline errorstats: ${baseline}"
     end_time=$((SECONDS + DURATION))
     count=0
     while (( SECONDS < end_time )) && (( count < PULSE_MAX )); do
-      eval "${pulse_cmd}"
+      case "${ERROR_TYPE}" in
+        NOAUTH)
+          redis-cli --no-auth-warning -h "${host}" -p "${port}" PING >/dev/null 2>&1 || true
+          ;;
+        WRONGPASS)
+          redis-cli --no-auth-warning -h "${host}" -p "${port}" \
+            --user "${REDIS_ACL_USER:-default}" --pass wrong_password PING >/dev/null 2>&1 || true
+          ;;
+        MOVED)
+          redis_cmd_nocluster "${NODE}" SET "fault:moved:${RANDOM}" value >/dev/null 2>&1 || true
+          ;;
+        CROSSSLOT)
+          redis_cmd "${NODE}" MGET "{faulta}:1" "{faultb}:2" >/dev/null 2>&1 || true
+          ;;
+      esac
       count=$((count + 1))
       sleep "${PULSE_INTERVAL}"
     done
+    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep -E 'NOAUTH|WRONGPASS|MISCONF|MOVED|CROSSSLOT' || true)"
     log "sent ${count} ${ERROR_TYPE} pulses"
+    [[ -n "${after}" ]] && log "after errorstats: ${after}"
     ;;
   historical-misconf)
-    log "seed historical MISCONF on ${NODE}"
-    run_on_target "
-      redis-cli -h ${host} -p ${port} CONFIG SET stop-writes-on-bgsave-error yes >/dev/null 2>&1 || true
-      chmod -R a-w ${REDIS_DATA_DIR}
-      redis-cli -h ${host} -p ${port} SET historical:misconf:seed 1 >/dev/null 2>&1 || true
-      chmod -R u+w ${REDIS_DATA_DIR}
-    "
-    log "historical counter seeded; no auto-restore (restart redis to clear if needed)"
+    log "seed historical MISCONF on ${NODE} (persistent until manual cleanup/restart)"
+    before="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF || echo 'MISCONF:0')"
+    log "before: ${before}"
+    redis_cmd "${NODE}" CONFIG SET stop-writes-on-bgsave-error yes >/dev/null 2>&1 || \
+      die "cannot set stop-writes-on-bgsave-error on ${NODE}"
+    run_on_target "chmod -R a-w ${REDIS_DATA_DIR}"
+    redis_cmd "${NODE}" SET "fault:historical:misconf:$(date +%s)" seed >/dev/null 2>&1 || true
+    run_on_target "chmod -R u+w ${REDIS_DATA_DIR}"
+    redis_cmd "${NODE}" BGSAVE >/dev/null 2>&1 || true
+    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF || echo '')"
+    persist="$(redis_cmd "${NODE}" INFO PERSISTENCE 2>/dev/null | grep -E 'rdb_last_bgsave_status|aof_last_write_status' || true)"
+    log "after: ${after}"
+    log "persistence: ${persist}"
+    log "expect for diagnosis bot: cumulative MISCONF > 0, current persistence ok, no new delta during window"
     ;;
   *)
     usage

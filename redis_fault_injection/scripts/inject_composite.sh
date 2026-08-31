@@ -51,24 +51,25 @@ done
 
 require_action
 parse_duration
+acquire_inject_lock
 
 case "${ACTION}" in
   memory-plus-misconf)
-    bash "${SCRIPT_DIR}/inject_redis.sh" --action historical-misconf --node "${MISCONF_NODE}"
-    bash "${SCRIPT_DIR}/inject_host.sh" --action memory --target-host "${MEMORY_NODE%%:*}" --duration "${DURATION}"
+    INJECT_LOCK_SKIP=1 bash "${SCRIPT_DIR}/inject_redis.sh" --action historical-misconf --node "${MISCONF_NODE}"
+    INJECT_LOCK_SKIP=1 bash "${SCRIPT_DIR}/inject_host.sh" --action memory --target-host "${MEMORY_NODE%%:*}" --duration "${DURATION}"
     ;;
   write-reject-plus-cpu)
-    bash "${SCRIPT_DIR}/inject_disk.sh" --action persistence-fail --node "${WRITE_NODE}" --duration "${DURATION}" &
+    INJECT_LOCK_SKIP=1 bash "${SCRIPT_DIR}/inject_disk.sh" --action persistence-fail --node "${WRITE_NODE}" --duration "${DURATION}" &
     p1=$!
-    bash "${SCRIPT_DIR}/inject_host.sh" --action cpu --target-host "${WRITE_NODE%%:*}" --duration "${DURATION}" &
+    INJECT_LOCK_SKIP=1 bash "${SCRIPT_DIR}/inject_host.sh" --action cpu --target-host "${WRITE_NODE%%:*}" --duration "${DURATION}" &
     p2=$!
     wait "${p1}" "${p2}"
     log "composite write-reject-plus-cpu finished"
     ;;
   master-stop-plus-memory)
-    bash "${SCRIPT_DIR}/inject_redis.sh" --action process-stop --node "${STOP_NODE}" --duration "${DURATION}" &
+    INJECT_LOCK_SKIP=1 bash "${SCRIPT_DIR}/inject_redis.sh" --action process-stop --node "${STOP_NODE}" --duration "${DURATION}" &
     p1=$!
-    bash "${SCRIPT_DIR}/inject_host.sh" --action memory --target-host "${MEM_NODE%%:*}" --duration "${DURATION}" &
+    INJECT_LOCK_SKIP=1 bash "${SCRIPT_DIR}/inject_host.sh" --action memory --target-host "${MEM_NODE%%:*}" --duration "${DURATION}" &
     p2=$!
     wait "${p1}" "${p2}"
     log "composite master-stop-plus-memory finished"

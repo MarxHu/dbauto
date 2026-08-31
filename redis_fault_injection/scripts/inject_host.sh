@@ -25,9 +25,9 @@ Actions:
   reboot            Reboot target host (no auto-recover; requires --confirm YES)
 
 Examples:
-  $0 --action cpu --target-host 10.10.26.144 --duration 240
-  $0 --action memory --target-host 10.10.26.144 --duration 240
-  $0 --action multi-cpu --duration 240
+  $0 --action cpu --duration 600
+  $0 --action memory --duration 600
+  $0 --action multi-cpu --duration 600
 EOF
 }
 
@@ -66,18 +66,21 @@ case "${ACTION}" in
     log "baseline ok; run diagnosis pipeline"
     ;;
   cpu)
+    acquire_inject_lock
     parse_duration
     require_cmd stress-ng
     run_on_target "nohup stress-ng --cpu 0 --cpu-load ${CPU_LOAD} --timeout ${DURATION}s >/tmp/redis_fault_cpu.log 2>&1 &"
     run_timed_fault "${DURATION}" recover_cpu
     ;;
   memory)
+    acquire_inject_lock
     parse_duration
     require_cmd stress-ng
     run_on_target "nohup stress-ng --vm ${MEM_WORKERS} --vm-bytes ${MEM_PERCENT}% --timeout ${DURATION}s >/tmp/redis_fault_mem.log 2>&1 &"
     run_timed_fault "${DURATION}" recover_memory
     ;;
   cpu-spike)
+    acquire_inject_lock
     parse_duration
     require_cmd stress-ng
     run_on_target "
@@ -91,17 +94,19 @@ case "${ACTION}" in
     run_timed_fault "${DURATION}" recover_cpu_spike
     ;;
   multi-cpu)
+    acquire_inject_lock
     parse_duration
     for node in ${REDIS_NODES}; do
       host="${node%%:*}"
       log "start cpu fault on ${host} for ${DURATION}s"
-      TARGET_HOST="${host}" ACTION=cpu DURATION="${DURATION}" bash "${SCRIPT_DIR}/inject_host.sh" \
+      INJECT_LOCK_SKIP=1 TARGET_HOST="${host}" bash "${SCRIPT_DIR}/inject_host.sh" \
         --action cpu --duration "${DURATION}" --target-host "${host}" &
     done
     wait
     log "all host cpu faults finished and auto-recovered"
     ;;
   reboot)
+    acquire_inject_lock
     [[ "${CONFIRM}" == "YES" ]] || die "reboot requires --confirm YES"
     log "rebooting ${TARGET_HOST:-localhost} in 5s (no auto-recover)"
     run_on_target "sleep 5 && reboot"
