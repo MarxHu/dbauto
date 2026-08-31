@@ -1,14 +1,15 @@
-# Redis 7.2 Cluster 三主（3 节点）部署流程
-# 拓扑：172.30.0.11 / .12 / .13 各为一个 master shard，共 16384 slots
-# 模式：Redis Cluster（非 Sentinel）
+# Redis 7.2 Cluster 三主（3 节点）二进制部署流程
+# 部署方式：各节点执行 shell 脚本；从 Redis 官方开源地址下载源码包编译安装
+# 拓扑：172.30.0.11 / .12 / .13 各为一个 master shard（--cluster-replicas 0）
 # 默认密码：Redis@1314
 
 apiVersion: dbauto/v1
 kind: RedisClusterDeployment
 metadata:
   name: redis72-cluster-3node
-  redis_version: "7.2"
+  redis_version: "7.2.16"
   topology: redis-cluster
+  deploy_mode: binary
 
 parameters:
   redis_password:
@@ -18,14 +19,38 @@ parameters:
     description: Redis 服务端口
     default: 6379
   cluster_bus_port:
-    description: Cluster 总线端口（默认服务端口 + 10000）
+    description: Cluster 总线端口（服务端口 + 10000）
     default: 16379
   cluster_node_timeout_ms:
     description: 集群节点超时（毫秒）
     default: 15000
   cluster_replicas:
-    description: 每个 master 分配的 replica 数量；三主零从填 0
+    description: 每个 master 的 replica 数；三主零从填 0
     default: 0
+  install_prefix:
+    description: 二进制安装目录
+    default: "/opt/redis/7.2.16"
+
+# 官方开源部署包地址（Redis 官方仅发布源码 tar.gz，各节点下载后本地 make install）
+packages:
+  redis:
+    version: "7.2.16"
+    format: tarball-source
+    tarball_url: https://download.redis.io/releases/redis-7.2.16.tar.gz
+    tarball_sha256: 960a8ec15e34ff40e57ff16837b26b33bd81f2da6d24497bb63de532a323a18e
+    hash_index_url: https://github.com/redis/redis-hashes
+    github_release_url: https://github.com/redis/redis/releases/tag/7.2.16
+    github_source_tarball: https://github.com/redis/redis/archive/refs/tags/7.2.16.tar.gz
+    stable_tarball_url: https://download.redis.io/redis-stable.tar.gz
+    install_method: compile
+    install_prefix: "{{ params.install_prefix }}"
+    build_deps:
+      - gcc
+      - make
+      - tcl
+      - wget
+      - curl
+      - tar
 
 hosts:
   - ip: 172.30.0.11
@@ -38,124 +63,72 @@ hosts:
     role: cluster-node
     node_id: node-13
 
+# 脚本目录（随 YAML 一起下发到各节点后执行）
+scripts_dir: deployments/数据库部署脚本/scripts/redis72-cluster-3node
+
 phases:
   - name: 环境预检
-    steps:
-      - action: check_port_available
-        ports:
-          - "{{ params.redis_port }}"
-          - "{{ params.cluster_bus_port }}"
-      - action: check_conflicting_packages
-        packages:
-          - redis
-        policy: warn_or_remove_orphans
-      - action: check_ulimit
-        expect:
-          nofile_min: 65535
-      - action: check_cluster_prereq
-        expect:
-          min_nodes: 3
-          cluster_mode: redis-cluster
-          not_sentinel: true
+    run_on: all
+    script: "{{ scripts_dir }}/01-precheck.sh"
+    env:
+      REDIS_PORT: "{{ params.redis_port }}"
+      CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
 
-  - name: 安装RPM
-    steps:
-      - action: install_redis_rpm
-        version: "7.2"
-        enable_epel_or_remi: true
+  - name: 下载编译安装二进制
+    description: >
+      从 packages.redis.tarball_url 下载官方 tar.gz，
+      校验 SHA256 后在各节点编译安装到 install_prefix。
+    run_on: all
+    script: "{{ scripts_dir }}/02-install-binary.sh"
+    env:
+      REDIS_VERSION: "{{ packages.redis.version }}"
+      REDIS_TARBALL_URL: "{{ packages.redis.tarball_url }}"
+      REDIS_TARBALL_SHA256: "{{ packages.redis.tarball_sha256 }}"
+      INSTALL_PREFIX: "{{ params.install_prefix }}"
 
-  - name: 集群配置持久化
-    description: 三节点统一启用 cluster-enabled，写入 redis.conf
-    steps:
-      - action: configure_redis
-        file: /etc/redis/redis.conf
-        content: |
-          bind 0.0.0.0
-          port {{ params.redis_port }}
-          protected-mode yes
-          daemonize no
-          supervised systemd
-          pidfile /var/run/redis_{{ params.redis_port }}.pid
-          logfile /var/log/redis/redis.log
-          dir /var/lib/redis
-          appendonly yes
-          appendfsync everysec
-          requirepass {{ params.redis_password }}
-          masterauth {{ params.redis_password }}
-          tcp-keepalive 300
-          timeout 0
-          maxmemory-policy noeviction
-          cluster-enabled yes
-          cluster-config-file nodes-{{ params.redis_port }}.conf
-          cluster-node-timeout {{ params.cluster_node_timeout_ms }}
-          cluster-require-full-coverage yes
-          cluster-announce-ip {{ host.ip }}
-          cluster-announce-port {{ params.redis_port }}
-          cluster-announce-bus-port {{ params.cluster_bus_port }}
+  - name: 生成配置与 systemd
+    run_on: all
+    script: "{{ scripts_dir }}/03-configure.sh"
+    env:
+      REDIS_VERSION: "{{ packages.redis.version }}"
+      INSTALL_PREFIX: "{{ params.install_prefix }}"
+      REDIS_PASSWORD: "{{ params.redis_password }}"
+      REDIS_PORT: "{{ params.redis_port }}"
+      CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
+      CLUSTER_NODE_TIMEOUT_MS: "{{ params.cluster_node_timeout_ms }}"
+      NODE_IP: "{{ host.ip }}"
 
-  - name: 启动服务
-    steps:
-      - action: start_service
-        service: redis
+  - name: 启动 redis-server
+    run_on: all
+    script: "{{ scripts_dir }}/04-start.sh"
 
   - name: 创建三主集群
-    description: >
-      在首节点执行 redis-cli --cluster create，三主零从（--cluster-replicas 0）。
-      仅在集群尚未初始化时执行。
+    description: 仅在 172.30.0.11 执行 redis-cli --cluster create
     run_on: 172.30.0.11
-    auth:
-      password: "{{ params.redis_password }}"
-    commands:
-      - run: >
-          redis-cli -a '{{ params.redis_password }}' --cluster create
-          172.30.0.11:{{ params.redis_port }}
-          172.30.0.12:{{ params.redis_port }}
-          172.30.0.13:{{ params.redis_port }}
-          --cluster-replicas {{ params.cluster_replicas }}
-          --cluster-yes
-        when: cluster_not_initialized
-        comment: 分配 16384 slots 到 3 个 master
+    script: "{{ scripts_dir }}/05-cluster-create.sh"
+    env:
+      REDIS_VERSION: "{{ packages.redis.version }}"
+      INSTALL_PREFIX: "{{ params.install_prefix }}"
+      REDIS_PASSWORD: "{{ params.redis_password }}"
+      REDIS_PORT: "{{ params.redis_port }}"
+      CLUSTER_REPLICAS: "{{ params.cluster_replicas }}"
+      NODE1: 172.30.0.11
+      NODE2: 172.30.0.12
+      NODE3: 172.30.0.13
 
-  - name: 集群拓扑验收
-    steps:
-      - action: assert_redis_cluster
-        on_hosts: all
-        auth:
-          password: "{{ params.redis_password }}"
-        checks:
-          - command: "CLUSTER INFO"
-            expect_fields:
-              cluster_state: ok
-              cluster_slots_assigned: "16384"
-              cluster_known_nodes: "3"
-              cluster_size: "3"
-          - command: "CLUSTER NODES"
-            expect:
-              master_count: 3
-              replica_count: 0
-              all_nodes_connected: true
+  - name: 部署验收
+    run_on: all
+    script: "{{ scripts_dir }}/06-verify.sh"
+    env:
+      REDIS_VERSION: "{{ packages.redis.version }}"
+      INSTALL_PREFIX: "{{ params.install_prefix }}"
+      REDIS_PASSWORD: "{{ params.redis_password }}"
+      REDIS_PORT: "{{ params.redis_port }}"
 
-      - action: assert_redis_cluster_routing
-        run_on: 172.30.0.11
-        auth:
-          password: "{{ params.redis_password }}"
-        checks:
-          - command: "SET deploy:cluster:verify 1"
-            expect: OK
-          - command: "CLUSTER KEYSLOT deploy:cluster:verify"
-            expect_slot_range: "0-16383"
-          - command: "GET deploy:cluster:verify"
-            expect: "1"
-
-      - action: assert_redis_cluster_cross_node
-        description: 验证 key 可路由到不同 slot / 节点
-        run_on: 172.30.0.11
-        auth:
-          password: "{{ params.redis_password }}"
-        checks:
-          - command: "SET sops:verify:node11 11"
-            expect: OK
-          - command: "SET sops:verify:node12 12"
-            expect: OK
-          - command: "SET sops:verify:node13 13"
-            expect: OK
+# 手工部署示例（三台分别执行 01-04，11 上再跑 05，最后三台跑 06）：
+# export REDIS_PASSWORD='Redis@1314'
+# bash 01-precheck.sh && bash 02-install-binary.sh && bash 03-configure.sh && bash 04-start.sh
+# # 仅在 172.30.0.11：
+# bash 05-cluster-create.sh
+# # 三台：
+# bash 06-verify.sh
