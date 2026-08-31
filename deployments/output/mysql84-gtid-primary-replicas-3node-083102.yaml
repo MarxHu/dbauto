@@ -1,0 +1,94 @@
+# MySQL 8.4 GTID 一主两从（3 节点）部署流程
+# 修复：临时密码阶段须先 ALTER USER，再执行其它 SQL（MySQL 8.4 ERROR 1820）
+
+apiVersion: dbauto/v1
+kind: MySQLClusterDeployment
+metadata:
+  name: mysql84-gtid-primary-replicas-3node-083102
+  mysql_version: "8.4"
+  topology: gtid-primary-replicas
+
+parameters:
+  root_password:
+    description: MySQL root 目标密码（用于替换安装后的临时密码）
+    required: true
+  repl_user:
+    description: 复制账号
+    default: repl
+  repl_password:
+    description: 复制账号密码
+    required: true
+
+hosts:
+  - ip: 172.30.0.11
+    role: primary
+    server_id: 11
+  - ip: 172.30.0.12
+    role: replica
+    server_id: 12
+  - ip: 172.30.0.13
+    role: replica
+    server_id: 13
+
+phases:
+  - name: 环境预检
+    steps:
+      - action: check_native_mysql_family_conflict
+        description: 检查是否已存在 MySQL/MariaDB/GreatSQL RPM
+        orphan_packages_auto_remove:
+          - mariadb-libs
+        fail_when:
+          - package_has_dependents
+
+  - name: 安装RPM
+    steps:
+      - action: install_mysql_rpm
+        version: "8.4"
+
+  - name: 启动服务
+    steps:
+      - action: start_mysqld
+        service: mysqld
+
+  - name: 临时密码改密
+    description: >
+      MySQL 8.4 临时密码登录后仅允许 ALTER USER。
+      必须先改密，再执行 SELECT / SET sql_log_bin 等语句。
+    auth:
+      user: root
+      password_source: temporary_from_mysqld_log
+    sql:
+      # 1) 必须第一步：用参数 root_password 替换临时密码
+      - statement: "ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ params.root_password }}';"
+        comment: 临时密码态下唯一允许的写操作
+
+      # 2) 改密成功后，再关本会话 binlog（避免初始化语句写入复制链路）
+      - statement: "SET SESSION sql_log_bin = 0;"
+        comment: 须在 ALTER USER 之后执行
+
+      # 3) 记录当前 GTID 位点，供后续主从对齐
+      - statement: "SELECT @@global.gtid_executed;"
+        comment: 须在 ALTER USER 之后执行
+
+  - name: 复制用户与GTID
+    auth:
+      user: root
+      password: "{{ params.root_password }}"
+    sql:
+      - statement: "CREATE USER IF NOT EXISTS '{{ params.repl_user }}'@'%' IDENTIFIED BY '{{ params.repl_password }}';"
+      - statement: "GRANT REPLICATION SLAVE ON *.* TO '{{ params.repl_user }}'@'%';"
+      - statement: "FLUSH PRIVILEGES;"
+
+  - name: 从库建立复制
+    when: "host.role == 'replica'"
+    auth:
+      user: root
+      password: "{{ params.root_password }}"
+    sql:
+      - statement: >
+          CHANGE REPLICATION SOURCE TO
+          SOURCE_HOST='172.30.0.11',
+          SOURCE_USER='{{ params.repl_user }}',
+          SOURCE_PASSWORD='{{ params.repl_password }}',
+          SOURCE_AUTO_POSITION=1;
+      - statement: "START REPLICA;"
