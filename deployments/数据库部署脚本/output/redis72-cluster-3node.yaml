@@ -1,0 +1,161 @@
+# Redis 7.2 Cluster 三主（3 节点）部署流程
+# 拓扑：172.30.0.11 / .12 / .13 各为一个 master shard，共 16384 slots
+# 模式：Redis Cluster（非 Sentinel）
+# 默认密码：Redis@1314
+
+apiVersion: dbauto/v1
+kind: RedisClusterDeployment
+metadata:
+  name: redis72-cluster-3node
+  redis_version: "7.2"
+  topology: redis-cluster
+
+parameters:
+  redis_password:
+    description: Redis 集群认证密码（requirepass / masterauth）
+    default: "Redis@1314"
+  redis_port:
+    description: Redis 服务端口
+    default: 6379
+  cluster_bus_port:
+    description: Cluster 总线端口（默认服务端口 + 10000）
+    default: 16379
+  cluster_node_timeout_ms:
+    description: 集群节点超时（毫秒）
+    default: 15000
+  cluster_replicas:
+    description: 每个 master 分配的 replica 数量；三主零从填 0
+    default: 0
+
+hosts:
+  - ip: 172.30.0.11
+    role: cluster-node
+    node_id: node-11
+  - ip: 172.30.0.12
+    role: cluster-node
+    node_id: node-12
+  - ip: 172.30.0.13
+    role: cluster-node
+    node_id: node-13
+
+phases:
+  - name: 环境预检
+    steps:
+      - action: check_port_available
+        ports:
+          - "{{ params.redis_port }}"
+          - "{{ params.cluster_bus_port }}"
+      - action: check_conflicting_packages
+        packages:
+          - redis
+        policy: warn_or_remove_orphans
+      - action: check_ulimit
+        expect:
+          nofile_min: 65535
+      - action: check_cluster_prereq
+        expect:
+          min_nodes: 3
+          cluster_mode: redis-cluster
+          not_sentinel: true
+
+  - name: 安装RPM
+    steps:
+      - action: install_redis_rpm
+        version: "7.2"
+        enable_epel_or_remi: true
+
+  - name: 集群配置持久化
+    description: 三节点统一启用 cluster-enabled，写入 redis.conf
+    steps:
+      - action: configure_redis
+        file: /etc/redis/redis.conf
+        content: |
+          bind 0.0.0.0
+          port {{ params.redis_port }}
+          protected-mode yes
+          daemonize no
+          supervised systemd
+          pidfile /var/run/redis_{{ params.redis_port }}.pid
+          logfile /var/log/redis/redis.log
+          dir /var/lib/redis
+          appendonly yes
+          appendfsync everysec
+          requirepass {{ params.redis_password }}
+          masterauth {{ params.redis_password }}
+          tcp-keepalive 300
+          timeout 0
+          maxmemory-policy noeviction
+          cluster-enabled yes
+          cluster-config-file nodes-{{ params.redis_port }}.conf
+          cluster-node-timeout {{ params.cluster_node_timeout_ms }}
+          cluster-require-full-coverage yes
+          cluster-announce-ip {{ host.ip }}
+          cluster-announce-port {{ params.redis_port }}
+          cluster-announce-bus-port {{ params.cluster_bus_port }}
+
+  - name: 启动服务
+    steps:
+      - action: start_service
+        service: redis
+
+  - name: 创建三主集群
+    description: >
+      在首节点执行 redis-cli --cluster create，三主零从（--cluster-replicas 0）。
+      仅在集群尚未初始化时执行。
+    run_on: 172.30.0.11
+    auth:
+      password: "{{ params.redis_password }}"
+    commands:
+      - run: >
+          redis-cli -a '{{ params.redis_password }}' --cluster create
+          172.30.0.11:{{ params.redis_port }}
+          172.30.0.12:{{ params.redis_port }}
+          172.30.0.13:{{ params.redis_port }}
+          --cluster-replicas {{ params.cluster_replicas }}
+          --cluster-yes
+        when: cluster_not_initialized
+        comment: 分配 16384 slots 到 3 个 master
+
+  - name: 集群拓扑验收
+    steps:
+      - action: assert_redis_cluster
+        on_hosts: all
+        auth:
+          password: "{{ params.redis_password }}"
+        checks:
+          - command: "CLUSTER INFO"
+            expect_fields:
+              cluster_state: ok
+              cluster_slots_assigned: "16384"
+              cluster_known_nodes: "3"
+              cluster_size: "3"
+          - command: "CLUSTER NODES"
+            expect:
+              master_count: 3
+              replica_count: 0
+              all_nodes_connected: true
+
+      - action: assert_redis_cluster_routing
+        run_on: 172.30.0.11
+        auth:
+          password: "{{ params.redis_password }}"
+        checks:
+          - command: "SET deploy:cluster:verify 1"
+            expect: OK
+          - command: "CLUSTER KEYSLOT deploy:cluster:verify"
+            expect_slot_range: "0-16383"
+          - command: "GET deploy:cluster:verify"
+            expect: "1"
+
+      - action: assert_redis_cluster_cross_node
+        description: 验证 key 可路由到不同 slot / 节点
+        run_on: 172.30.0.11
+        auth:
+          password: "{{ params.redis_password }}"
+        checks:
+          - command: "SET sops:verify:node11 11"
+            expect: OK
+          - command: "SET sops:verify:node12 12"
+            expect: OK
+          - command: "SET sops:verify:node13 13"
+            expect: OK
