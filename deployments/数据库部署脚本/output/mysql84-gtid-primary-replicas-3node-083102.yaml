@@ -1,7 +1,10 @@
 # MySQL 8.4 GTID 一主两从（3 节点）部署流程
-# 修复：
-# - 临时密码阶段须先 ALTER USER，再执行其它 SQL（MySQL 8.4 ERROR 1820）
-# - 从库复制须 GET_SOURCE_PUBLIC_KEY=1（caching_sha2_password 无 SSL 时 ERROR 2061）
+# 修复与加固：
+# - 临时密码阶段须先 ALTER USER（ERROR 1820）
+# - 从库复制须 GET_SOURCE_PUBLIC_KEY=1（ERROR 2061）
+# - 从库 read_only + super_read_only，防误写
+# - 主从半同步（rpl_semi_sync_source / rpl_semi_sync_replica）
+# - 角色配置持久化到 my.cnf，重启不丢
 
 apiVersion: dbauto/v1
 kind: MySQLClusterDeployment
@@ -20,6 +23,12 @@ parameters:
   repl_password:
     description: 复制账号密码
     required: true
+  semi_sync_timeout_ms:
+    description: 主库半同步等待从库 ACK 超时（毫秒）
+    default: 10000
+  semi_sync_wait_replica_count:
+    description: 主库提交事务前至少等待 ACK 的从库数量
+    default: 1
 
 hosts:
   - ip: 172.30.0.11
@@ -47,6 +56,41 @@ phases:
       - action: install_mysql_rpm
         version: "8.4"
 
+  - name: 角色配置持久化
+    description: 按主/从写入 my.cnf，重启后仍保持 GTID、只读与半同步
+    steps:
+      - action: configure_mysqld
+        when: "host.role == 'primary'"
+        file: /etc/my.cnf.d/mysql-cluster.cnf
+        content: |
+          [mysqld]
+          server-id={{ host.server_id }}
+          gtid_mode=ON
+          enforce_gtid_consistency=ON
+          log_bin=mysql-bin
+          binlog_format=ROW
+          log_replica_updates=ON
+          plugin_load_add=semisync_source.so
+          rpl_semi_sync_source_enabled=1
+          rpl_semi_sync_source_wait_for_replica_count={{ params.semi_sync_wait_replica_count }}
+          rpl_semi_sync_source_timeout={{ params.semi_sync_timeout_ms }}
+
+      - action: configure_mysqld
+        when: "host.role == 'replica'"
+        file: /etc/my.cnf.d/mysql-cluster.cnf
+        content: |
+          [mysqld]
+          server-id={{ host.server_id }}
+          gtid_mode=ON
+          enforce_gtid_consistency=ON
+          log_replica_updates=ON
+          read_only=1
+          super_read_only=1
+          relay_log=mysql-relay-bin
+          replica_preserve_commit_order=1
+          plugin_load_add=semisync_replica.so
+          rpl_semi_sync_replica_enabled=1
+
   - name: 启动服务
     steps:
       - action: start_mysqld
@@ -60,19 +104,15 @@ phases:
       user: root
       password_source: temporary_from_mysqld_log
     sql:
-      # 1) 必须第一步：用参数 root_password 替换临时密码
       - statement: "ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ params.root_password }}';"
         comment: 临时密码态下唯一允许的写操作
-
-      # 2) 改密成功后，再关本会话 binlog（避免初始化语句写入复制链路）
       - statement: "SET SESSION sql_log_bin = 0;"
         comment: 须在 ALTER USER 之后执行
-
-      # 3) 记录当前 GTID 位点，供后续主从对齐
       - statement: "SELECT @@global.gtid_executed;"
         comment: 须在 ALTER USER 之后执行
 
-  - name: 复制用户与GTID
+  - name: 主库创建复制用户
+    when: "host.role == 'primary'"
     auth:
       user: root
       password: "{{ params.root_password }}"
@@ -94,5 +134,73 @@ phases:
           SOURCE_PASSWORD='{{ params.repl_password }}',
           SOURCE_AUTO_POSITION=1,
           GET_SOURCE_PUBLIC_KEY=1;
-        comment: MySQL 8 默认 caching_sha2_password，无 SSL 复制须向主库索取 RSA 公钥
+        comment: caching_sha2_password 无 SSL 复制须索取 RSA 公钥
       - statement: "START REPLICA;"
+
+  - name: 拓扑保护加固
+    description: 复制链路就绪后启用半同步；从库强制只读（运行时生效，与 my.cnf 双保险）
+    steps:
+      - action: wait_replication
+        when: "host.role == 'replica'"
+        expect:
+          replica_io_running: Yes
+          replica_sql_running: Yes
+          seconds_behind_source: 0
+
+      - action: run_sql
+        when: "host.role == 'replica'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        sql:
+          - statement: "INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';"
+            on_error: ignore_if_exists
+          - statement: "SET GLOBAL rpl_semi_sync_replica_enabled = ON;"
+          - statement: "SET GLOBAL read_only = ON;"
+          - statement: "SET GLOBAL super_read_only = ON;"
+
+      - action: run_sql
+        when: "host.role == 'primary'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        sql:
+          - statement: "INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';"
+            on_error: ignore_if_exists
+          - statement: "SET GLOBAL rpl_semi_sync_source_wait_for_replica_count = {{ params.semi_sync_wait_replica_count }};"
+          - statement: "SET GLOBAL rpl_semi_sync_source_timeout = {{ params.semi_sync_timeout_ms }};"
+          - statement: "SET GLOBAL rpl_semi_sync_source_enabled = ON;"
+
+  - name: 部署验收
+    description: 确认一主两从拓扑与保护项均已生效
+    steps:
+      - action: assert_sql
+        when: "host.role == 'primary'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        checks:
+          - query: "SELECT @@global.gtid_mode;"
+            expect: "ON"
+          - query: "SELECT @@global.rpl_semi_sync_source_enabled;"
+            expect: "ON"
+          - query: "SELECT COUNT(*) FROM performance_schema.replication_connection_status WHERE SERVICE_STATE='ON';"
+            expect: "2"
+            comment: 主库应看到 2 条活跃复制连接（从库 12/13）
+
+      - action: assert_sql
+        when: "host.role == 'replica'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        checks:
+          - query: "SELECT @@global.read_only;"
+            expect: "ON"
+          - query: "SELECT @@global.super_read_only;"
+            expect: "ON"
+          - query: "SELECT @@global.rpl_semi_sync_replica_enabled;"
+            expect: "ON"
+          - query: "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1;"
+            expect: "ON"
+          - query: "SELECT SERVICE_STATE FROM performance_schema.replication_applier_status_by_coordinator LIMIT 1;"
+            expect: "ON"
