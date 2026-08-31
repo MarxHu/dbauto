@@ -4,7 +4,9 @@
 # - 确保 /etc/my.cnf 加载 my.cnf.d（8.4 RPM 默认可能无 includedir）
 # - init 配置仅含 GTID/server_id/复制必需项，不含半同步变量
 # - 半同步、从库只读运行时启用（复制就绪后）
-# - 建复制前 fail-fast 验收 gtid_mode / server_id
+# - 先改密再验收（防 ERROR 1820）
+# - 复制就绪检查用 performance_schema，不用 SHOW REPLICA STATUS\G（防 runner -N 空值）
+# - 建复制含 GET_SOURCE_PUBLIC_KEY=1（防 ERROR 2061）
 
 apiVersion: dbauto/v1
 kind: MySQLClusterDeployment
@@ -149,14 +151,29 @@ phases:
       - statement: "START REPLICA;"
 
   - name: 拓扑保护加固
-    description: 复制就绪后启用半同步与从库只读（运行期，不写 init cnf）
+    description: >
+      复制就绪后启用半同步与从库只读（运行期，不写 init cnf）。
+      不用 wait_replication + SHOW REPLICA STATUS\G：runner 的 mysql -N
+      会剥掉列名导致 awk 取不到 IO/SQL/behind。改用 performance_schema 单值查询。
     steps:
-      - action: wait_replication
+      - action: assert_sql
         when: "host.role == 'replica'"
-        expect:
-          replica_io_running: Yes
-          replica_sql_running: Yes
-          seconds_behind_source: 0
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        checks:
+          - query: "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1;"
+            expect: "ON"
+            comment: 等价 Replica_IO_Running=Yes
+          - query: "SELECT SERVICE_STATE FROM performance_schema.replication_applier_status_by_coordinator LIMIT 1;"
+            expect: "ON"
+            comment: 等价 Replica_SQL_Running=Yes
+          - query: >
+              SELECT IF(
+                (SELECT RECEIVED_TRANSACTION_SET FROM performance_schema.replication_connection_status LIMIT 1)
+                = @@GLOBAL.gtid_executed, 0, 1);
+            expect: "0"
+            comment: 收到的 GTID 已应用到本机，等价 behind=0
 
       - action: run_sql
         when: "host.role == 'replica'"

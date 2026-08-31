@@ -15,6 +15,38 @@ MySQL 8.4 临时密码态 **只允许 ALTER USER**，因此：
 
 **禁止**在改密前执行任何 SELECT（含 `@@gtid_mode`），否则 ERROR 1820。
 
+## Runner 坑：wait_replication + mysql -Nse + \G
+
+`mysql -N` 会去掉列名；`SHOW REPLICA STATUS\G` 再交给 awk 匹配 `Replica_IO_Running:` 会得到空值。
+
+YAML 已改为用 `performance_schema` 单值查询（`-N` 下也能比），不再依赖 `wait_replication`。
+
+若要改 runner：对 `\G` 输出不要加 `-N`，或改为：
+
+```bash
+mysql -Nse "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1"
+```
+
+## 现有失败现场（复制已通、保护未装）——不重置
+
+在 **.12 / .13** 执行：
+
+```sql
+INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';
+SET GLOBAL rpl_semi_sync_replica_enabled = ON;
+SET GLOBAL read_only = ON;
+SET GLOBAL super_read_only = ON;
+```
+
+在 **.11** 执行：
+
+```sql
+INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
+SET GLOBAL rpl_semi_sync_source_wait_for_replica_count = 1;
+SET GLOBAL rpl_semi_sync_source_timeout = 10000;
+SET GLOBAL rpl_semi_sync_source_enabled = ON;
+```
+
 ## 相对旧版的关键变化
 
 | 问题 | 旧版 | 新版 |
