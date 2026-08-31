@@ -373,7 +373,10 @@ post_check_cpu() {
   local min_used="${1:-80}"
   sleep 5
   local avg
-  avg="$(run_on_target "vmstat 1 3 | awk 'NR>2 {idle=\$15; if(idle!=\"\") {sum+=100-idle; n++}} END {if(n>0) printf \"%.0f\", sum/n; else print \"0\"}'")"
+  # vmstat prints 2 header lines, then 1 since-boot summary, then interval samples.
+  # Use vmstat 1 4 and skip NR<=3 so the average is only over 3 true 1s intervals
+  # (including since-boot idle ~90%+ falsely pulls avg below the 80% gate).
+  avg="$(run_on_target "vmstat 1 4 | awk 'NR>3 {idle=\$15; if(idle!=\"\") {sum+=100-idle; n++}} END {if(n>0) printf \"%.0f\", sum/n; else print \"0\"}'")"
   if [[ -z "${avg}" ]] || ! [[ "${avg}" =~ ^[0-9]+$ ]]; then
     log "POSTCHECK FAIL: could not parse CPU from vmstat on $(target_label)"
     return 1
