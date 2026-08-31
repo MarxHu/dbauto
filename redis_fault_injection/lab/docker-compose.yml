@@ -1,0 +1,88 @@
+name: redis-fault-lab
+
+networks:
+  redis_lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.26.0/24
+          gateway: 10.10.26.1
+
+services:
+  redis-n1:
+    build:
+      context: .
+      dockerfile: Dockerfile.redis
+    image: redis-fault-lab/redis-node:7.2
+    container_name: redis-n1
+    hostname: redis-n1
+    networks:
+      redis_lab:
+        ipv4_address: 10.10.26.144
+    ports:
+      - "6379:6379"
+      - "16379:16379"
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - redis_n1_data:/var/lib/redis/6379
+    restart: unless-stopped
+
+  redis-n2:
+    build:
+      context: .
+      dockerfile: Dockerfile.redis
+    image: redis-fault-lab/redis-node:7.2
+    container_name: redis-n2
+    hostname: redis-n2
+    networks:
+      redis_lab:
+        ipv4_address: 10.10.26.145
+    ports:
+      - "6380:6379"
+      - "16380:16379"
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - redis_n2_data:/var/lib/redis/6379
+    restart: unless-stopped
+
+  redis-n3:
+    build:
+      context: .
+      dockerfile: Dockerfile.redis
+    image: redis-fault-lab/redis-node:7.2
+    container_name: redis-n3
+    hostname: redis-n3
+    networks:
+      redis_lab:
+        ipv4_address: 10.10.26.146
+    ports:
+      - "6381:6379"
+      - "16381:16379"
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - redis_n3_data:/var/lib/redis/6379
+    restart: unless-stopped
+
+  docker-node:
+    build:
+      context: .
+      dockerfile: Dockerfile.inject
+    image: redis-fault-lab/inject-node:24.04
+    container_name: docker-node
+    hostname: docker-node
+    networks:
+      redis_lab:
+        ipv4_address: 10.10.26.10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../:/workspace/redis_fault_injection:rw
+    working_dir: /workspace/redis_fault_injection
+    restart: unless-stopped
+
+volumes:
+  redis_n1_data:
+  redis_n2_data:
+  redis_n3_data:

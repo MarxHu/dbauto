@@ -1,0 +1,32 @@
+FROM redis:7.2-bookworm
+
+USER root
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      stress-ng \
+      procps \
+      iproute2 \
+      iptables \
+      bash \
+      coreutils \
+      ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /var/lib/redis/6379 \
+ && chown redis:redis /var/lib/redis/6379
+
+# Verify required tools at build time
+RUN command -v stress-ng \
+ && command -v vmstat \
+ && command -v chmod \
+ && command -v dd \
+ && command -v iptables \
+ && command -v tc \
+ && command -v bash \
+ && redis-server --version
+
+COPY redis.conf /usr/local/etc/redis/redis.conf
+
+EXPOSE 6379 16379
+
+CMD ["redis-server", "/usr/local/etc/redis/redis.conf"]
