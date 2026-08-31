@@ -50,14 +50,16 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=notify
+Type=simple
 User=root
 Group=root
+Environment=REDISCLI_AUTH=${REDIS_PASSWORD}
 ExecStart=${INSTALL_PREFIX}/bin/redis-server ${CONF_DIR}/redis.conf
-ExecStop=${INSTALL_PREFIX}/bin/redis-cli -a '${REDIS_PASSWORD}' -p ${REDIS_PORT} shutdown
+ExecStop=${INSTALL_PREFIX}/bin/redis-cli -p ${REDIS_PORT} shutdown
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
+TimeoutStartSec=120
 
 [Install]
 WantedBy=multi-user.target

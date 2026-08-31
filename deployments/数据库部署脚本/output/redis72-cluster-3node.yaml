@@ -2,6 +2,7 @@
 # 部署方式：各节点执行 shell 脚本；从 Redis 官方开源地址下载源码包编译安装
 # 拓扑：172.30.0.11 / .12 / .13 各为一个 master shard（--cluster-replicas 0）
 # 默认密码：Redis@1314
+# 定位：自动化测试用标准集群（不要求 HA）
 
 apiVersion: dbauto/v1
 kind: RedisClusterDeployment
@@ -30,8 +31,10 @@ parameters:
   install_prefix:
     description: 二进制安装目录
     default: "/opt/redis/7.2.16"
+  wait_timeout_sec:
+    description: 等待各节点就绪超时（秒）
+    default: 120
 
-# 官方开源部署包地址（Redis 官方仅发布源码 tar.gz，各节点下载后本地 make install）
 packages:
   redis:
     version: "7.2.16"
@@ -63,7 +66,6 @@ hosts:
     role: cluster-node
     node_id: node-13
 
-# 脚本目录（随 YAML 一起下发到各节点后执行）
 scripts_dir: deployments/数据库部署脚本/scripts/redis72-cluster-3node
 
 phases:
@@ -74,12 +76,21 @@ phases:
       REDIS_PORT: "{{ params.redis_port }}"
       CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
 
-  - name: 下载编译安装二进制
-    description: >
-      从 packages.redis.tarball_url 下载官方 tar.gz，
-      校验 SHA256 后在各节点编译安装到 install_prefix。
+  - name: 内核参数
     run_on: all
-    script: "{{ scripts_dir }}/02-install-binary.sh"
+    script: "{{ scripts_dir }}/02-sysctl.sh"
+
+  - name: 防火墙放行
+    description: 本机放行 6379/16379（firewalld 或 ufw）
+    run_on: all
+    script: "{{ scripts_dir }}/03-network-firewall.sh"
+    env:
+      REDIS_PORT: "{{ params.redis_port }}"
+      CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
+
+  - name: 下载编译安装二进制
+    run_on: all
+    script: "{{ scripts_dir }}/04-install-binary.sh"
     env:
       REDIS_VERSION: "{{ packages.redis.version }}"
       REDIS_TARBALL_URL: "{{ packages.redis.tarball_url }}"
@@ -88,7 +99,7 @@ phases:
 
   - name: 生成配置与 systemd
     run_on: all
-    script: "{{ scripts_dir }}/03-configure.sh"
+    script: "{{ scripts_dir }}/05-configure.sh"
     env:
       REDIS_VERSION: "{{ packages.redis.version }}"
       INSTALL_PREFIX: "{{ params.install_prefix }}"
@@ -100,12 +111,26 @@ phases:
 
   - name: 启动 redis-server
     run_on: all
-    script: "{{ scripts_dir }}/04-start.sh"
+    script: "{{ scripts_dir }}/06-start.sh"
+
+  - name: 等待全部节点就绪
+    description: 从 11 检查三节点 6379/16379 连通与 PING
+    run_on: 172.30.0.11
+    script: "{{ scripts_dir }}/07-wait-nodes.sh"
+    env:
+      REDIS_VERSION: "{{ packages.redis.version }}"
+      INSTALL_PREFIX: "{{ params.install_prefix }}"
+      REDIS_PASSWORD: "{{ params.redis_password }}"
+      REDIS_PORT: "{{ params.redis_port }}"
+      CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
+      WAIT_TIMEOUT_SEC: "{{ params.wait_timeout_sec }}"
+      NODE1: 172.30.0.11
+      NODE2: 172.30.0.12
+      NODE3: 172.30.0.13
 
   - name: 创建三主集群
-    description: 仅在 172.30.0.11 执行 redis-cli --cluster create
     run_on: 172.30.0.11
-    script: "{{ scripts_dir }}/05-cluster-create.sh"
+    script: "{{ scripts_dir }}/08-cluster-create.sh"
     env:
       REDIS_VERSION: "{{ packages.redis.version }}"
       INSTALL_PREFIX: "{{ params.install_prefix }}"
@@ -118,17 +143,19 @@ phases:
 
   - name: 部署验收
     run_on: all
-    script: "{{ scripts_dir }}/06-verify.sh"
+    script: "{{ scripts_dir }}/09-verify.sh"
     env:
       REDIS_VERSION: "{{ packages.redis.version }}"
       INSTALL_PREFIX: "{{ params.install_prefix }}"
       REDIS_PASSWORD: "{{ params.redis_password }}"
       REDIS_PORT: "{{ params.redis_port }}"
+      NODE1: 172.30.0.11
 
-# 手工部署示例（三台分别执行 01-04，11 上再跑 05，最后三台跑 06）：
+# 手工部署顺序（三台 01-06，11 上 07-08，三台 09）：
 # export REDIS_PASSWORD='Redis@1314'
-# bash 01-precheck.sh && bash 02-install-binary.sh && bash 03-configure.sh && bash 04-start.sh
-# # 仅在 172.30.0.11：
-# bash 05-cluster-create.sh
+# bash 01-precheck.sh && bash 02-sysctl.sh && bash 03-network-firewall.sh
+# bash 04-install-binary.sh && bash 05-configure.sh && bash 06-start.sh
+# # 172.30.0.11：
+# bash 07-wait-nodes.sh && bash 08-cluster-create.sh
 # # 三台：
-# bash 06-verify.sh
+# bash 09-verify.sh

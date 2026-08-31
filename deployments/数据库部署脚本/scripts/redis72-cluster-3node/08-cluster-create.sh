@@ -13,17 +13,18 @@ NODE2="${NODE2:-172.30.0.12}"
 NODE3="${NODE3:-172.30.0.13}"
 
 CLI="${INSTALL_PREFIX}/bin/redis-cli"
+export REDISCLI_AUTH="${REDIS_PASSWORD}"
 
 log() { echo "[$(date '+%F %T')][创建集群][$HOSTNAME] $*"; }
 
-cluster_state="$("${CLI}" -a "${REDIS_PASSWORD}" -h "${NODE1}" -p "${REDIS_PORT}" CLUSTER INFO 2>/dev/null | awk -F: '/cluster_state/ {print $2}' | tr -d '\r' || true)"
+cluster_state="$("${CLI}" -h "${NODE1}" -p "${REDIS_PORT}" CLUSTER INFO 2>/dev/null | awk -F: '/cluster_state/ {print $2}' | tr -d '\r' || true)"
 if [[ "${cluster_state}" == "ok" ]]; then
   log "集群已是 cluster_state:ok，跳过 create"
   exit 0
 fi
 
 log "执行 redis-cli --cluster create（三主零从）"
-"${CLI}" -a "${REDIS_PASSWORD}" --cluster create \
+"${CLI}" --cluster create \
   "${NODE1}:${REDIS_PORT}" \
   "${NODE2}:${REDIS_PORT}" \
   "${NODE3}:${REDIS_PORT}" \
