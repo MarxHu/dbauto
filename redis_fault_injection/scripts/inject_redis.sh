@@ -55,9 +55,9 @@ Extra options:
   --no-cleanup-bigkey      keep seeded big key after duration
 
 Examples:
-  $0 --action process-stop --node 10.10.26.144:6381 --duration 240
-  $0 --action maxmemory --node 10.10.26.144:6381 --duration 240 --maxmemory 64mb
-  $0 --action error-pulse --node 10.10.26.146:6381 --duration 90 --error-type NOAUTH
+  $0 --action process-stop --node 10.10.26.144:6379 --duration 240
+  $0 --action maxmemory --node 10.10.26.144:6379 --duration 240 --maxmemory 64mb
+  $0 --action error-pulse --node 10.10.26.146:6379 --duration 90 --error-type NOAUTH
 EOF
 }
 
@@ -65,10 +65,12 @@ recover_process_stop() {
   resolve_node
   local node="${STOPPED_NODE:-${NODE}}"
   TARGET_HOST="${TARGET_HOST:-${node%%:*}}"
-  log "auto-start redis on ${node}"
+  TARGET_CONTAINER="${TARGET_CONTAINER:-}"
+  log "auto-start redis on ${node} via ${INJECT_BACKEND}"
   run_on_target "
-    systemctl start redis 2>/dev/null || \
-    redis-server /etc/redis/redis.conf 2>/dev/null || true
+    systemctl start ${REDIS_SERVICE} 2>/dev/null || \
+    redis-server ${REDIS_CONF} 2>/dev/null || \
+    redis-server --port ${node##*:} --dir ${REDIS_DATA_DIR:-/var/lib/redis} --daemonize yes 2>/dev/null || true
   "
 }
 
@@ -119,6 +121,8 @@ while [[ $# -gt 0 ]]; do
     --expire-key) EXPIRE_KEY="$2"; shift 2 ;;
     --request-count) REQUEST_COUNT="$2"; shift 2 ;;
     --key) KEY="$2"; shift 2 ;;
+    --target-host) TARGET_HOST="$2"; shift 2 ;;
+    --target-container) TARGET_CONTAINER="$2"; shift 2 ;;
     --no-cleanup-bigkey) CLEANUP_BIGKEY="no"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -136,10 +140,11 @@ case "${ACTION}" in
   process-stop)
     parse_duration
     STOPPED_NODE="${NODE}"
-    TARGET_HOST="${TARGET_HOST:-${host}}"
+    bind_target_from_node "${NODE}"
+    resolve_data_dir "${NODE}" || true
     RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
-    log "stop redis on ${NODE} for ${DURATION}s via SSH ${TARGET_HOST}"
-    run_on_target "${RCLI} SHUTDOWN NOSAVE 2>/dev/null || systemctl stop ${REDIS_SERVICE:-redis} 2>/dev/null || pkill -f 'redis-server.*:${port}' || true"
+    log "stop redis on ${NODE} for ${DURATION}s via ${INJECT_BACKEND} $(target_label)"
+    run_on_target "${RCLI} SHUTDOWN NOSAVE 2>/dev/null || systemctl stop ${REDIS_SERVICE} 2>/dev/null || pkill -f 'redis-server' || true"
     sleep 2
     post_check_ping_down "${NODE}" || { emit_inject_result "process-stop" "fail" "still pingable"; exit 1; }
     emit_inject_result "process-stop" "pass" "redis down on ${NODE}"
@@ -293,7 +298,8 @@ case "${ACTION}" in
     fi
     ;;
   historical-misconf)
-    TARGET_HOST="${TARGET_HOST:-${host}}"
+    bind_target_from_node "${NODE}"
+    resolve_data_dir "${NODE}"
     RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
     before="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF | awk -F: '{gsub(/\r/,"",$2); print $2}' || echo 0)"
     before="${before:-0}"
@@ -320,14 +326,15 @@ case "${ACTION}" in
     ;;
   historical-misconf-cleanup)
     MISCONF_CLEANUP_RESTART="${MISCONF_CLEANUP_RESTART:-YES}"
-    TARGET_HOST="${TARGET_HOST:-${host}}"
+    bind_target_from_node "${NODE}"
+    resolve_data_dir "${NODE}" || true
     RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
     orig_stop="$(load_misconf_state "${NODE}" stop_writes "yes")"
     redis_cmd "${NODE}" CONFIG SET stop-writes-on-bgsave-error "${orig_stop}" >/dev/null 2>&1 || true
     if [[ "${MISCONF_CLEANUP_RESTART}" == "YES" ]]; then
-      run_on_target "${RCLI} SHUTDOWN NOSAVE 2>/dev/null || systemctl stop ${REDIS_SERVICE:-redis} 2>/dev/null || true"
+      run_on_target "${RCLI} SHUTDOWN NOSAVE 2>/dev/null || systemctl stop ${REDIS_SERVICE} 2>/dev/null || pkill -f redis-server || true"
       sleep 2
-      run_on_target "systemctl start ${REDIS_SERVICE:-redis} 2>/dev/null || redis-server ${REDIS_CONF:-/etc/redis/redis.conf} 2>/dev/null || true"
+      run_on_target "systemctl start ${REDIS_SERVICE} 2>/dev/null || redis-server ${REDIS_CONF} 2>/dev/null || true"
       for _ in $(seq 1 30); do
         redis_cmd "${NODE}" PING >/dev/null 2>&1 && break
         sleep 1

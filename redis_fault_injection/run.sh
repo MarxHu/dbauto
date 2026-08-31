@@ -17,7 +17,8 @@ Categories:
 
 Example:
   $0 host --action cpu --target-host 10.10.26.144 --duration 240
-  $0 redis --action maxmemory --node 10.10.26.144:6381 --duration 240
+  $0 host --action cpu --target-container redis-144 --duration 240
+  $0 redis --action maxmemory --node 10.10.26.144:6379 --duration 240
 EOF
   exit 1
 fi

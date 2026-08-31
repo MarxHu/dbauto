@@ -9,16 +9,30 @@ if [[ -f "${ROOT_DIR}/config.env" ]]; then
   source "${ROOT_DIR}/config.env"
 fi
 
-REDIS_NODES="${REDIS_NODES:-10.10.26.144:6381 10.10.26.145:6381 10.10.26.146:6381}"
+# Lab model: docker-node runs injection bot; Redis lives in Docker containers
+# that simulate VMs (binary redis inside). Host-level faults use docker exec.
+INJECT_BACKEND="${INJECT_BACKEND:-docker}"
+
+REDIS_NODES="${REDIS_NODES:-10.10.26.144:6379 10.10.26.145:6379 10.10.26.146:6379}"
 REDIS_PASSWORD="${REDIS_PASSWORD:-}"
 REDIS_CLI="${REDIS_CLI:-redis-cli}"
 CLUSTER_BUS_PORT="${CLUSTER_BUS_PORT:-16379}"
 TARGET_HOST="${TARGET_HOST:-}"
+TARGET_CONTAINER="${TARGET_CONTAINER:-}"
 FAULT_DURATION_SEC="${FAULT_DURATION_SEC:-600}"
 SSH_USER="${SSH_USER:-root}"
-REDIS_DATA_DIR="${REDIS_DATA_DIR:-/var/lib/redis}"
+# Prefer CONFIG GET dir when empty or "auto"
+REDIS_DATA_DIR="${REDIS_DATA_DIR:-auto}"
+REDIS_CONF="${REDIS_CONF:-/etc/redis/redis.conf}"
+REDIS_SERVICE="${REDIS_SERVICE:-redis}"
+# Optional: "ip:container ip:container ..." — overrides auto IP→container lookup
+REDIS_CONTAINER_MAP="${REDIS_CONTAINER_MAP:-}"
+# Optional: space-separated container names in same order as REDIS_NODES
+REDIS_CONTAINERS="${REDIS_CONTAINERS:-}"
+
 STATE_DIR="${ROOT_DIR}/.state"
 INJECT_LOCK_FILE="${STATE_DIR}/inject.lock"
+DOCKER_ALL_OK="${STATE_DIR}/docker_all_nodes.ok"
 
 if [[ -n "${REDIS_PASSWORD}" ]]; then
   export REDISCLI_AUTH="${REDIS_PASSWORD}"
@@ -48,14 +62,169 @@ acquire_inject_lock() {
   log "acquired injection lock"
 }
 
+# --- backend: docker | ssh | local ------------------------------------------
+
+container_from_map() {
+  local host="$1"
+  local entry ip name
+  for entry in ${REDIS_CONTAINER_MAP}; do
+    ip="${entry%%:*}"
+    name="${entry#*:}"
+    if [[ "${ip}" == "${host}" ]]; then
+      printf '%s' "${name}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+container_from_order() {
+  local host="$1"
+  local i=0
+  local node h
+  local -a containers=()
+  # shellcheck disable=SC2206
+  containers=(${REDIS_CONTAINERS})
+  [[ ${#containers[@]} -gt 0 ]] || return 1
+  for node in ${REDIS_NODES}; do
+    h="${node%%:*}"
+    if [[ "${h}" == "${host}" ]]; then
+      printf '%s' "${containers[$i]:-}"
+      [[ -n "${containers[$i]:-}" ]]
+      return $?
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+container_from_docker_ip() {
+  local host="$1"
+  local id name ips
+  require_cmd docker
+  while read -r id; do
+    [[ -n "${id}" ]] || continue
+    ips="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "${id}" 2>/dev/null || true)"
+    if echo " ${ips} " | grep -q " ${host} "; then
+      name="$(docker inspect -f '{{.Name}}' "${id}" | sed 's#^/##')"
+      printf '%s' "${name}"
+      return 0
+    fi
+  done < <(docker ps -q)
+  return 1
+}
+
+resolve_container() {
+  local host_or_name="${1:-}"
+  [[ -n "${host_or_name}" ]] || return 1
+
+  # Already a running container name?
+  if docker inspect "${host_or_name}" >/dev/null 2>&1; then
+    printf '%s' "${host_or_name}"
+    return 0
+  fi
+
+  local ctn=""
+  ctn="$(container_from_map "${host_or_name}" 2>/dev/null || true)"
+  if [[ -z "${ctn}" ]]; then
+    ctn="$(container_from_order "${host_or_name}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${ctn}" ]]; then
+    ctn="$(container_from_docker_ip "${host_or_name}" 2>/dev/null || true)"
+  fi
+  [[ -n "${ctn}" ]] || return 1
+  docker inspect "${ctn}" >/dev/null 2>&1 || return 1
+  printf '%s' "${ctn}"
+}
+
+# Resolve TARGET_CONTAINER from TARGET_HOST / TARGET_CONTAINER / --node host
+ensure_target_container() {
+  if [[ -n "${TARGET_CONTAINER}" ]]; then
+    docker inspect "${TARGET_CONTAINER}" >/dev/null 2>&1 \
+      || die "container not found: ${TARGET_CONTAINER}"
+    return 0
+  fi
+  [[ -n "${TARGET_HOST}" ]] || return 1
+  TARGET_CONTAINER="$(resolve_container "${TARGET_HOST}")" \
+    || die "cannot map ${TARGET_HOST} to a docker container; set REDIS_CONTAINER_MAP or --target-container"
+  log "resolved ${TARGET_HOST} -> container ${TARGET_CONTAINER}"
+}
+
+require_target() {
+  case "${INJECT_BACKEND}" in
+    docker)
+      if [[ -z "${TARGET_CONTAINER}" && -z "${TARGET_HOST}" ]]; then
+        die "host-level fault requires --target-host <container IP> or --target-container <name>"
+      fi
+      ensure_target_container
+      ;;
+    ssh)
+      [[ -n "${TARGET_HOST}" ]] || die "host-level fault requires --target-host <IP> (INJECT_BACKEND=ssh)"
+      ;;
+    local)
+      :
+      ;;
+    *)
+      die "unknown INJECT_BACKEND=${INJECT_BACKEND} (use docker|ssh|local)"
+      ;;
+  esac
+}
+
 run_on_target() {
   local cmd="$1"
-  if [[ -n "${TARGET_HOST}" ]]; then
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${TARGET_HOST}" "${cmd}"
-  else
-    bash -lc "${cmd}"
-  fi
+  case "${INJECT_BACKEND}" in
+    docker)
+      ensure_target_container
+      docker exec "${TARGET_CONTAINER}" bash -lc "${cmd}"
+      ;;
+    ssh)
+      [[ -n "${TARGET_HOST}" ]] || die "TARGET_HOST empty for ssh backend"
+      ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${TARGET_HOST}" "${cmd}"
+      ;;
+    local)
+      bash -lc "${cmd}"
+      ;;
+  esac
 }
+
+# Run a command on a specific host/container without clobbering caller's target forever
+run_on_host() {
+  local host="$1"
+  local cmd="$2"
+  local saved_host="${TARGET_HOST}"
+  local saved_ctn="${TARGET_CONTAINER}"
+  TARGET_HOST="${host}"
+  TARGET_CONTAINER=""
+  run_on_target "${cmd}"
+  local rc=$?
+  TARGET_HOST="${saved_host}"
+  TARGET_CONTAINER="${saved_ctn}"
+  return "${rc}"
+}
+
+target_label() {
+  case "${INJECT_BACKEND}" in
+    docker) printf '%s' "${TARGET_CONTAINER:-${TARGET_HOST:-unknown}}" ;;
+    *) printf '%s' "${TARGET_HOST:-localhost}" ;;
+  esac
+}
+
+docker_check() {
+  local ctn="$1"
+  docker inspect -f '{{.State.Running}}' "${ctn}" 2>/dev/null | grep -q true
+}
+
+docker_cmd_check() {
+  local ctn="$1"
+  local cmd="$2"
+  docker exec "${ctn}" bash -lc "command -v ${cmd}" >/dev/null 2>&1
+}
+
+require_all_targets_ok() {
+  [[ -f "${DOCKER_ALL_OK}" ]] || die "requires all docker nodes ready; run preflight.sh first"
+}
+
+# --- redis helpers ----------------------------------------------------------
 
 redis_cmd() {
   local addr="$1"
@@ -97,11 +266,13 @@ usage_header() {
 Usage: $0 --action <name> [options]
 
 Common options:
-  --duration <sec>       Fault active time, auto-recover after expiry (default: ${FAULT_DURATION_SEC})
-  --target-host <ip>     Optional remote host via SSH (default: local machine)
-  --node <ip:port>       Redis endpoint (default: first node in config)
-  -h, --help             Show help
+  --duration <sec>            Fault active time, auto-recover after expiry (default: ${FAULT_DURATION_SEC})
+  --target-host <ip>          Container IP (or host) to inject into
+  --target-container <name>   Docker container name (INJECT_BACKEND=docker)
+  --node <ip:port>            Redis endpoint (default: first node in config)
+  -h, --help                  Show help
 
+Backend: INJECT_BACKEND=${INJECT_BACKEND} (docker|ssh|local)
 Injection bot runs one action at a time; lock file: ${INJECT_LOCK_FILE}
 EOF
 }
@@ -160,6 +331,7 @@ clear_misconf_state() {
   rm -f "$(misconf_state_file "${1}")"
 }
 
+# Command string to run redis-cli *inside* the target container
 remote_redis_cli() {
   local host="$1"
   local port="$2"
@@ -175,31 +347,27 @@ detect_redis_data_dir() {
   redis_cmd "${node}" CONFIG GET dir 2>/dev/null | awk 'NR==2{print; exit}'
 }
 
-ssh_check() {
-  local host="$1"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${host}" "echo ok" >/dev/null 2>&1
+resolve_data_dir() {
+  local node="${1:-$(first_node)}"
+  if [[ -z "${REDIS_DATA_DIR}" || "${REDIS_DATA_DIR}" == "auto" ]]; then
+    REDIS_DATA_DIR="$(detect_redis_data_dir "${node}" || true)"
+    [[ -n "${REDIS_DATA_DIR}" ]] || die "cannot detect Redis dir; set REDIS_DATA_DIR in config.env"
+    log "using Redis data dir from CONFIG GET dir: ${REDIS_DATA_DIR}"
+  fi
 }
 
-require_target_host() {
-  [[ -n "${TARGET_HOST}" ]] || die "host-level fault requires --target-host <VM IP> (injection bot runs outside Docker/VM nodes)"
+# Bind target from a redis node address (ip:port)
+bind_target_from_node() {
+  local node="${1:-}"
+  resolve_node
+  node="${node:-${NODE}}"
+  TARGET_HOST="${TARGET_HOST:-${node%%:*}}"
+  if [[ "${INJECT_BACKEND}" == "docker" ]]; then
+    ensure_target_container
+  fi
 }
 
-require_ssh_all_nodes() {
-  [[ -f "${STATE_DIR}/ssh_all_nodes.ok" ]] || die "requires all VM nodes SSH reachable; run preflight.sh first"
-}
-
-require_ssh_hosts() {
-  local host
-  for host in "$@"; do
-    ssh_check "${host}" || die "SSH unreachable ${SSH_USER}@${host} (run preflight.sh)"
-  done
-}
-
-remote_cmd_check() {
-  local host="$1"
-  local cmd="$2"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${host}" "command -v ${cmd}" >/dev/null 2>&1
-}
+# --- post-checks ------------------------------------------------------------
 
 post_check_cpu() {
   local min_used="${1:-80}"
@@ -207,7 +375,7 @@ post_check_cpu() {
   local avg
   avg="$(run_on_target "vmstat 1 3 | awk 'NR>2 {idle=\$15; if(idle!=\"\") {sum+=100-idle; n++}} END {if(n>0) printf \"%.0f\", sum/n; else print \"0\"}'")"
   if [[ -z "${avg}" ]] || ! [[ "${avg}" =~ ^[0-9]+$ ]]; then
-    log "POSTCHECK FAIL: could not parse CPU from vmstat on ${TARGET_HOST:-localhost}"
+    log "POSTCHECK FAIL: could not parse CPU from vmstat on $(target_label)"
     return 1
   fi
   if (( avg >= min_used )); then
@@ -222,9 +390,28 @@ post_check_memory() {
   local max_avail="${1:-15}"
   sleep 5
   local avail_pct
-  avail_pct="$(run_on_target "awk '/MemTotal:/{t=\$2} /MemAvailable:/{a=\$2} END{if(t>0) print int(a*100/t); else print 100}' /proc/meminfo")"
+  # Prefer cgroup limit when present (docker memory limit); else /proc/meminfo
+  avail_pct="$(run_on_target '
+    if [[ -f /sys/fs/cgroup/memory.max ]]; then
+      max=$(cat /sys/fs/cgroup/memory.max)
+      cur=$(cat /sys/fs/cgroup/memory.current)
+      if [[ "$max" != "max" && "$max" -gt 0 ]]; then
+        echo $(( (max - cur) * 100 / max ))
+        exit 0
+      fi
+    fi
+    if [[ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+      max=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+      cur=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes)
+      if [[ "$max" -lt 9000000000000000000 && "$max" -gt 0 ]]; then
+        echo $(( (max - cur) * 100 / max ))
+        exit 0
+      fi
+    fi
+    awk "/MemTotal:/{t=\$2} /MemAvailable:/{a=\$2} END{if(t>0) print int(a*100/t); else print 100}" /proc/meminfo
+  ')"
   if [[ -z "${avail_pct}" ]] || ! [[ "${avail_pct}" =~ ^[0-9]+$ ]]; then
-    log "POSTCHECK FAIL: could not parse memory from /proc/meminfo on ${TARGET_HOST:-localhost}"
+    log "POSTCHECK FAIL: could not parse memory on $(target_label)"
     return 1
   fi
   if (( avail_pct <= max_avail )); then
@@ -260,4 +447,21 @@ emit_inject_result() {
   local status="$2"
   local detail="${3:-}"
   log "INJECT_RESULT scenario=${scenario} status=${status} detail=${detail}"
+}
+
+# Restart "VM" = docker restart container (simulates host reboot)
+restart_target() {
+  case "${INJECT_BACKEND}" in
+    docker)
+      ensure_target_container
+      log "docker restart ${TARGET_CONTAINER} (simulates VM reboot)"
+      docker restart "${TARGET_CONTAINER}"
+      ;;
+    ssh)
+      run_on_target "reboot"
+      ;;
+    local)
+      die "reboot not supported on local backend"
+      ;;
+  esac
 }

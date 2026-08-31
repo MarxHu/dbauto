@@ -15,12 +15,13 @@ usage() {
   cat <<EOF
 
 Actions:
-  persistence-fail     Make redis data dir read-only on VM and trigger BGSAVE
-  io-stress            Sustained disk write load on --target-host VM
+  persistence-fail     Make redis data dir read-only in container and trigger BGSAVE
+  io-stress            Sustained disk write load inside target container
 
 Examples:
-  $0 --action persistence-fail --node 10.10.26.146:6381 --duration 600
+  $0 --action persistence-fail --node 10.10.26.146:6379 --duration 600
   $0 --action io-stress --target-host 10.10.26.144 --duration 600
+  $0 --action io-stress --target-container redis-144 --duration 600
 EOF
 }
 
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --duration) DURATION="$2"; shift 2 ;;
     --node) NODE="$2"; shift 2 ;;
     --target-host) TARGET_HOST="$2"; shift 2 ;;
+    --target-container) TARGET_CONTAINER="$2"; shift 2 ;;
     --data-dir) REDIS_DATA_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -53,29 +55,32 @@ case "${ACTION}" in
   persistence-fail)
     parse_duration
     resolve_node
-    host="${NODE%%:*}"
+    bind_target_from_node "${NODE}"
+    resolve_data_dir "${NODE}"
     port="${NODE##*:}"
-    TARGET_HOST="${TARGET_HOST:-${host}}"
     RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
-    log "persistence failure on ${NODE} via SSH ${TARGET_HOST}"
+    log "persistence failure on ${NODE} via ${INJECT_BACKEND} $(target_label)"
     run_on_target "chmod -R a-w ${REDIS_DATA_DIR}"
     run_on_target "${RCLI} CONFIG SET stop-writes-on-bgsave-error yes >/dev/null 2>&1 || true"
     run_on_target "${RCLI} BGSAVE >/dev/null 2>&1 || true"
-    emit_inject_result "persistence-fail" "pass" "data dir ro on ${TARGET_HOST}"
+    emit_inject_result "persistence-fail" "pass" "data dir ro on $(target_label)"
     run_timed_fault "${DURATION}" recover_persistence_fail
     ;;
   io-stress)
     parse_duration
-    require_target_host
-    run_on_target "
-      mkdir -p ${IO_DIR}
-      end=\$((SECONDS+${DURATION}))
-      while (( SECONDS < end )); do
-        dd if=/dev/zero of=${IO_DIR}/fault.bin bs=1M count=256 conv=fdatasync >/dev/null 2>&1 || true
-      done
-    " &
+    require_target
+    # Keep dd loop attached via docker exec -d style: run in background on bot calling docker exec
+    (
+      run_on_target "
+        mkdir -p ${IO_DIR}
+        end=\$((SECONDS+${DURATION}))
+        while (( SECONDS < end )); do
+          dd if=/dev/zero of=${IO_DIR}/fault.bin bs=1M count=256 conv=fdatasync >/dev/null 2>&1 || true
+        done
+      "
+    ) &
     IO_PID=$!
-    emit_inject_result "io-stress" "pass" "disk io on ${TARGET_HOST}"
+    emit_inject_result "io-stress" "pass" "disk io on $(target_label)"
     run_timed_fault "${DURATION}" recover_io_stress
     ;;
   *)

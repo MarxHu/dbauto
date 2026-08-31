@@ -14,28 +14,30 @@
 | **交付物** | Shell 脚本 + 场景清单 + 环境检查清单 |
 | **验收范围** | 只验收**故障是否被成功注入**（现象、持续、自动恢复） |
 | **不包含** | SOPS 排障、五路采集、AI 诊断（由你方独立 Bot/流程负责） |
-| **运行位置** | **注入 Bot 单独跑**，与 Docker 节点/模拟 VM **不在同一台机器** |
-| **故障路径** | 主机/网络/磁盘类 → Bot **SSH 到 VM** 执行；Redis 类 → Bot 用 `redis-cli` 连集群 IP |
+| **运行位置** | 注入 Bot 跑在 **docker-node** |
+| **故障路径** | Redis 用 Docker 容器**模拟 VM**（容器内二进制 Redis）；主机/网络/磁盘类 → **`docker exec`**；Redis 类 → Bot **`redis-cli`** |
 
-### 1.1 部署拓扑
+### 1.1 部署拓扑（实验室默认）
 
 ```text
-┌──────────────────────┐         SSH (root)          ┌─────────────────────────┐
-│  注入 Bot（独立机器）   │ ──────────────────────────► │  VM1  10.10.26.144      │
-│  redis-cli + scripts │                             │  二进制部署 redis:6381   │
-└──────────┬───────────┘         SSH                   ├─────────────────────────┤
-           │              ──────────────────────────► │  VM2  10.10.26.145      │
-           │  redis-cli :6381                           ├─────────────────────────┤
-           └──────────────────────────────────────────► │  VM3  10.10.26.146      │
-                                                        └─────────────────────────┘
-           排障 Bot（独立）── 读真实 Redis/主机状态，与本目录脚本无文件对接
+┌──────────────────────────┐   docker exec    ┌─────────────────────────────┐
+│  docker-node（注入 Bot）   │ ───────────────► │  container ≈ VM1            │
+│  redis-cli + docker +    │                  │  IP 10.10.26.144 redis:6379 │
+│  scripts                 │ ───────────────► ├─────────────────────────────┤
+└────────────┬─────────────┘                  │  container ≈ VM2 :145       │
+             │ redis-cli :6379                ├─────────────────────────────┤
+             └────────────────────────────────►│  container ≈ VM3 :146       │
+                                               └─────────────────────────────┘
 ```
 
 **要点**：
 
-- 主机级故障（F02/F04/F06/F09/F26/F28）必须带 **`--target-host <VM IP>`**
-- Redis 级故障（F07/F10/…）Bot 直连 `REDIS_NODES`，进程停止等需 SSH 到对应 VM
-- **F28 multi-cpu**：仅当 `preflight.sh` 检测到**三台 VM SSH 均可达**时启用（写入 `.state/ssh_all_nodes.ok`）
+- `INJECT_BACKEND=docker`（默认）；不要再依赖对 144/145/146 的 SSH
+- 配置 **`REDIS_CONTAINER_MAP`**（IP→容器名），或保证容器网络 IP 与 `REDIS_NODES` 一致以便自动发现
+- 主机级故障：`--target-host <容器IP>` 或 `--target-container <容器名>`
+- **F09 reboot** = `docker restart <container>`（模拟 VM 重启）
+- **F28**：仅 preflight 三容器全就绪（`.state/docker_all_nodes.ok`）时启用
+- **`REDIS_DATA_DIR=auto`**：自动用 `CONFIG GET dir`（如 `/var/lib/redis/6379`）
 
 ---
 
@@ -91,21 +93,27 @@ chmod +x run.sh scripts/*.sh lib/common.sh
 编辑 `config.env`（示例）：
 
 ```bash
-export REDIS_NODES="10.10.26.144:6381 10.10.26.145:6381 10.10.26.146:6381"
+export INJECT_BACKEND="docker"
+export REDIS_NODES="10.10.26.144:6379 10.10.26.145:6379 10.10.26.146:6379"
 export REDIS_PASSWORD="你的密码"          # 必填，勿提交 Git
-export REDIS_DATA_DIR="/var/lib/redis"  # VM 上 Redis 数据目录
-export FAULT_DURATION_SEC=600           # 持续型故障默认 10 分钟
-export SSH_USER="root"                  # Bot SSH 到 VM 的用户
-export TARGET_HOST=""                   # 留空；各命令用 --target-host 指定 VM
+export REDIS_DATA_DIR="auto"            # 自动 CONFIG GET dir（如 /var/lib/redis/6379）
+export REDIS_CONTAINER_MAP="10.10.26.144:redis-144 10.10.26.145:redis-145 10.10.26.146:redis-146"
+export FAULT_DURATION_SEC=600
 ```
 
-跑前检查（**三台 VM SSH + Redis PING 全 PASS 后再注入**）：
+查容器名与 IP：
+
+```bash
+docker inspect -f '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker ps -q)
+```
+
+跑前检查（**三容器 docker exec 可达 + Redis PING 全 PASS**）：
 
 ```bash
 ./scripts/preflight.sh
 ```
 
-必须 **FAIL=0** 再开始注入。通过后会在 `.state/ssh_all_nodes.ok` 标记，F28 才可用。
+必须 **FAIL=0** 再开始注入。通过后写入 `.state/docker_all_nodes.ok`，F28 才可用。
 
 ---
 
@@ -119,8 +127,8 @@ INJECT_RESULT scenario=<id> status=pass|fail detail=<...>
 
 | 场景 | Post-check 条件 |
 |---|---|
-| F02 cpu | VM 上 `vmstat` 3 次采样，CPU 使用率 avg **≥80%** |
-| F04 memory | VM `/proc/meminfo`，MemAvailable **≤15%** |
+| F02 cpu | 容器内 `vmstat` 3 次采样，CPU avg **≥80%** |
+| F04 memory | cgroup 或 `/proc/meminfo`，可用内存 **≤15%** |
 | F07 process-stop | Bot `redis-cli PING` **无响应** |
 | F19 error-pulse | `INFO ERRORSTATS` 对应计数 **递增** |
 | F29 historical-misconf | MISCONF 计数 **递增** |
@@ -142,17 +150,13 @@ echo "$out" | grep 'INJECT_RESULT scenario=cpu status=pass'
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│  注入 Bot（独立 Linux，可 SSH 到三台 VM）                       │
+│  docker-node（注入 Bot）                                      │
 ├─────────────────────────────────────────────────────────────┤
-│                                                             │
 │  注入 Bot                         排障 Bot（独立）            │
-│  ─────────                        ────────────              │
 │  1. preflight.sh                  1. 触发外部 SOPS/采集       │
-│  2. inject_*.sh --duration 600    2. 读 Redis/VM 真实状态     │
+│  2. docker exec / redis-cli 注入  2. 读 Redis/容器真实状态    │
 │  3. post-check → INJECT_RESULT    3. 清洗 + AI（不在本目录）  │
-│  4. 阻塞至 auto-recover 退出       4. 输出诊断结论            │
-│                                                             │
-│  「传递的数据」= 被注入后的真实集群状态（CPU/内存/日志/计数）   │
+│  4. duration 到期 auto-recover                               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -176,7 +180,7 @@ T600 注入 Bot: post-check 已通过，脚本阻塞至 duration 结束并 auto-
 cd /path/to/dbauto/redis_fault_injection
 ./scripts/inject_host.sh --action cpu --target-host 10.10.26.144 --duration 600
 ./run.sh host --action memory --target-host 10.10.26.145 --duration 600
-./run.sh redis --action maxmemory --node 10.10.26.144:6381 --duration 600
+./run.sh redis --action maxmemory --node 10.10.26.144:6379 --duration 600
 ```
 
 ---
@@ -188,7 +192,8 @@ cd /path/to/dbauto/redis_fault_injection
 | `--action` | 是 | — | 场景类型 |
 | `--duration` | 否 | `600` | 秒；到期自动恢复 |
 | `--node` | 部分 | 第一个节点 | `ip:port` |
-| `--target-host` | 主机/VM 网络类 | — | **必填**；目标 VM IP（Bot SSH 进入） |
+| `--target-host` | 主机类 | — | 容器 IP（映射到 docker 容器） |
+| `--target-container` | 主机类 | — | 直接指定容器名 |
 | `--error-type` | F19 | `NOAUTH` | `NOAUTH\|WRONGPASS\|MOVED\|CROSSSLOT` |
 | `--maxmemory` | F10 | `64mb` | |
 | `--maxclients` | F12 | `10` | |
@@ -219,10 +224,10 @@ cd /path/to/dbauto/redis_fault_injection
 | F02 | CPU 持续高压 | L1 | `./scripts/inject_host.sh --action cpu --target-host 10.10.26.144 --duration 600` |
 | F04 | 主机内存压力 | L1 | `./scripts/inject_host.sh --action memory --target-host 10.10.26.144 --duration 600` |
 | F06 | CPU 瞬时尖峰 | L2 | `./scripts/inject_host.sh --action cpu-spike --target-host 10.10.26.144 --duration 600` |
-| F09 | 主机重启 | L1 | `./scripts/inject_host.sh --action reboot --target-host 10.10.26.144 --confirm YES` |
-| F28 | 多节点 CPU 高 | L1 | `./scripts/inject_host.sh --action multi-cpu --duration 600`（需 preflight 三台 SSH OK） |
+| F09 | 主机重启 | L1 | `./scripts/inject_host.sh --action reboot --target-container <name> --confirm YES` |
+| F28 | 多节点 CPU 高 | L1 | `./scripts/inject_host.sh --action multi-cpu --duration 600`（需 docker_all_nodes.ok） |
 
-**验收要点**：F02 post-check → VM CPU avg≥80%；F04 → MemAvailable≤15%；F28 仅 `.state/ssh_all_nodes.ok` 存在时可用。
+**验收要点**：F02 → 容器内 CPU avg≥80%；F04 → 可用内存≤15%；F09 = `docker restart`。
 
 ---
 
@@ -230,21 +235,21 @@ cd /path/to/dbauto/redis_fault_injection
 
 | ID | 场景 | 等级 | 完整命令 |
 |---|---|---|---|
-| F07 | Redis 进程停止 | L1 | `./scripts/inject_redis.sh --action process-stop --node 10.10.26.144:6381 --duration 600` |
-| F10 | maxmemory / OOM | L1 | `./scripts/inject_redis.sh --action maxmemory --node 10.10.26.144:6381 --duration 600 --maxmemory 64mb` |
-| F12 | maxclients 打满 | L1 | `./scripts/inject_redis.sh --action maxclients --node 10.10.26.144:6381 --duration 600 --maxclients 10` |
-| F14 | 慢命令 | L1 | `./scripts/inject_redis.sh --action slow-command --node 10.10.26.144:6381 --duration 600` |
-| F15 | 热 Key / 热分片 | L2 | `./scripts/inject_redis.sh --action hot-key --node 10.10.26.145:6381 --duration 600` |
-| F16 | 大 Key 线索 | L2 | `./scripts/inject_redis.sh --action big-key --node 10.10.26.145:6381 --duration 600` |
-| F17 | 冷缓存（单 key） | 应用向 | `./scripts/inject_redis.sh --action cache-expire --node 10.10.26.144:6381 --expire-key mykey --duration 600` |
-| F17* | 冷缓存（FLUSHDB） | 危险 | `./scripts/inject_redis.sh --action cache-expire --node 10.10.26.144:6381 --duration 60` |
-| F18 | 缓存穿透 | 应用向 | `./scripts/inject_redis.sh --action cache-penetrate --node 10.10.26.144:6381 --duration 600 --request-count 100000` |
-| F19-NOAUTH | 错误密码脉冲 | L1 | `./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6381 --duration 600 --error-type NOAUTH` |
-| F19-WRONGPASS | ACL 错密码 | L1 | `./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6381 --duration 600 --error-type WRONGPASS` |
-| F19-MOVED | MOVED 脉冲 | L1 | `./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6381 --duration 600 --error-type MOVED` |
-| F19-CROSSSLOT | 跨 Slot 脉冲 | L1 | `./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6381 --duration 600 --error-type CROSSSLOT` |
-| F29 | 历史 MISCONF 背景 | 背景 | `./scripts/inject_redis.sh --action historical-misconf --node 10.10.26.146:6381` |
-| F29c | 清理 MISCONF | 清理 | `./scripts/inject_redis.sh --action historical-misconf-cleanup --node 10.10.26.146:6381` |
+| F07 | Redis 进程停止 | L1 | `./scripts/inject_redis.sh --action process-stop --node 10.10.26.144:6379 --duration 600` |
+| F10 | maxmemory / OOM | L1 | `./scripts/inject_redis.sh --action maxmemory --node 10.10.26.144:6379 --duration 600 --maxmemory 64mb` |
+| F12 | maxclients 打满 | L1 | `./scripts/inject_redis.sh --action maxclients --node 10.10.26.144:6379 --duration 600 --maxclients 10` |
+| F14 | 慢命令 | L1 | `./scripts/inject_redis.sh --action slow-command --node 10.10.26.144:6379 --duration 600` |
+| F15 | 热 Key / 热分片 | L2 | `./scripts/inject_redis.sh --action hot-key --node 10.10.26.145:6379 --duration 600` |
+| F16 | 大 Key 线索 | L2 | `./scripts/inject_redis.sh --action big-key --node 10.10.26.145:6379 --duration 600` |
+| F17 | 冷缓存（单 key） | 应用向 | `./scripts/inject_redis.sh --action cache-expire --node 10.10.26.144:6379 --expire-key mykey --duration 600` |
+| F17* | 冷缓存（FLUSHDB） | 危险 | `./scripts/inject_redis.sh --action cache-expire --node 10.10.26.144:6379 --duration 60` |
+| F18 | 缓存穿透 | 应用向 | `./scripts/inject_redis.sh --action cache-penetrate --node 10.10.26.144:6379 --duration 600 --request-count 100000` |
+| F19-NOAUTH | 错误密码脉冲 | L1 | `./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6379 --duration 600 --error-type NOAUTH` |
+| F19-WRONGPASS | ACL 错密码 | L1 | `./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6379 --duration 600 --error-type WRONGPASS` |
+| F19-MOVED | MOVED 脉冲 | L1 | `./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6379 --duration 600 --error-type MOVED` |
+| F19-CROSSSLOT | 跨 Slot 脉冲 | L1 | `./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6379 --duration 600 --error-type CROSSSLOT` |
+| F29 | 历史 MISCONF 背景 | 背景 | `./scripts/inject_redis.sh --action historical-misconf --node 10.10.26.146:6379` |
+| F29c | 清理 MISCONF | 清理 | `./scripts/inject_redis.sh --action historical-misconf-cleanup --node 10.10.26.146:6379` |
 
 **F19**：脉冲固定 5s×18=90s，日志会打印 pulse 前后 `INFO ERRORSTATS`。  
 **F29**：测完必须 F29c；C01 组合会自动 F29c。
@@ -255,7 +260,7 @@ cd /path/to/dbauto/redis_fault_injection
 
 | ID | 场景 | 等级 | 完整命令 |
 |---|---|---|---|
-| F20 | Cluster Bus 阻断 | L1 | `./scripts/inject_network.sh --action bus-block --node 10.10.26.144:6381 --duration 600` |
+| F20 | Cluster Bus 阻断 | L1 | `./scripts/inject_network.sh --action bus-block --node 10.10.26.144:6379 --duration 600` |
 | F22 | 客户端丢包 | L2 | `./scripts/inject_network.sh --action packet-loss --target-host 10.10.26.144 --duration 600 --loss 30 --net-dev eth0` |
 | F30 | 两 Master 分区 | L1 | `./scripts/inject_network.sh --action master-partition --node-a 10.10.26.144 --node-b 10.10.26.145 --duration 600` |
 
@@ -265,7 +270,7 @@ cd /path/to/dbauto/redis_fault_injection
 
 | ID | 场景 | 等级 | 完整命令 |
 |---|---|---|---|
-| F24 | 持久化失败 / MISCONF 链 | L1 | `./scripts/inject_disk.sh --action persistence-fail --node 10.10.26.146:6381 --duration 600` |
+| F24 | 持久化失败 / MISCONF 链 | L1 | `./scripts/inject_disk.sh --action persistence-fail --node 10.10.26.146:6379 --duration 600` |
 | F26 | 磁盘 IO 高 | L2 | `./scripts/inject_disk.sh --action io-stress --target-host 10.10.26.144 --duration 600` |
 
 ---
@@ -275,8 +280,8 @@ cd /path/to/dbauto/redis_fault_injection
 | ID | 场景 | 完整命令 | 说明 |
 |---|---|---|---|
 | C01 | 内存 + 历史 MISCONF | `./scripts/inject_composite.sh --action memory-plus-misconf --duration 600` | 144 内存 10min；146 MISCONF 背景；结束自动 cleanup |
-| C02 | 写拒绝 + CPU | `./scripts/inject_composite.sh --action write-reject-plus-cpu --write-node 10.10.26.144:6381 --duration 600` | 同节点持久化失败 + CPU |
-| C03 | Master 停 + 远端内存 | `./scripts/inject_composite.sh --action master-stop-plus-memory --stop-node 10.10.26.144:6381 --mem-node 10.10.26.146:6381 --duration 600` | 144 停 Redis；146 内存压力 |
+| C02 | 写拒绝 + CPU | `./scripts/inject_composite.sh --action write-reject-plus-cpu --write-node 10.10.26.144:6379 --duration 600` | 同节点持久化失败 + CPU |
+| C03 | Master 停 + 远端内存 | `./scripts/inject_composite.sh --action master-stop-plus-memory --stop-node 10.10.26.144:6379 --mem-node 10.10.26.146:6379 --duration 600` | 144 停 Redis；146 内存压力 |
 
 ---
 
@@ -300,28 +305,27 @@ cd /path/to/dbauto/redis_fault_injection
 
 ---
 
-## 8. 推荐首跑顺序（实验室）
+## 8. 推荐首跑顺序（实验室 docker-node）
 
 ```bash
-# 0. 配置 + preflight（三台 SSH + Redis 全 PASS）
-cp config.env.example config.env   # 填 REDIS_PASSWORD、SSH 免密
+# 0. 配置 + preflight（填 REDIS_CONTAINER_MAP）
+cp config.env.example config.env
 ./scripts/preflight.sh
 
 # 1. 基线
 ./scripts/inject_host.sh --action baseline
 
-# 2. 主机资源（各 VM 各跑至少 1 次，验证 post-check）
-./scripts/inject_host.sh --action cpu --target-host 10.10.26.144 --duration 600
-./scripts/inject_host.sh --action memory --target-host 10.10.26.144 --duration 600
+# 2. 主机资源（docker exec 进容器）
+./scripts/inject_host.sh --action cpu --target-host 10.10.26.144 --duration 120
+./scripts/inject_host.sh --action memory --target-host 10.10.26.144 --duration 120
 
-# 3. 单场景抽样
-./scripts/inject_redis.sh --action process-stop --node 10.10.26.144:6381 --duration 600
-./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6381 --error-type NOAUTH
-./scripts/inject_network.sh --action bus-block --node 10.10.26.144:6381 --duration 600
-./scripts/inject_disk.sh --action persistence-fail --node 10.10.26.146:6381 --duration 600
+# 3. Redis / 网络抽样
+./scripts/inject_redis.sh --action process-stop --node 10.10.26.144:6379 --duration 120
+./scripts/inject_redis.sh --action error-pulse --node 10.10.26.146:6379 --error-type NOAUTH
+./scripts/inject_network.sh --action bus-block --node 10.10.26.144:6379 --duration 120
 ```
 
-**合并条件**：实验室 `preflight.sh` **FAIL=0** 且上述场景 `INJECT_RESULT status=pass` 后，将功能分支合并到 `main`。
+**合并条件**：实验室 `preflight.sh` **FAIL=0** 且抽样 `INJECT_RESULT status=pass` 后合并到 `main`。
 
 ---
 
@@ -350,7 +354,7 @@ A：命令行 `--duration 300` 或改 `config.env` 里 `FAULT_DURATION_SEC`。
 A：持续型故障已自动恢复（F09 重启、F29 背景除外，见上文 cleanup）。
 
 **Q：注入 Bot 和 Redis 必须在同一台机器吗？**  
-A：否。Bot 单独跑，通过 SSH 对 VM 做主机/网络/磁盘故障，通过 `redis-cli` 对集群做 Redis 级故障。
+A：Bot 跑在 docker-node；Redis 在同机 Docker 容器内。主机故障用 `docker exec`，Redis 故障用 `redis-cli`。
 
 **Q：PR 合并后路径变吗？**  
 A：合并到 `main` 后路径为 `dbauto/redis_fault_injection/`，命令不变。
