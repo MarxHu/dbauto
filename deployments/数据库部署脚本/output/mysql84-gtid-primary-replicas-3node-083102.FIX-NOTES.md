@@ -30,6 +30,12 @@ SELECT @@global.gtid_executed;
 
 使用 YAML `parameters.root_password`（或你本地模板中的等价变量）作为 `ALTER USER` 的目标密码。
 
+## 文件位置与下载
+
+- 仓库路径：`deployments/数据库部署脚本/output/mysql84-gtid-primary-replicas-3node-083102.yaml`
+- 直接下载（PR 分支 raw）：
+  https://raw.githubusercontent.com/MarxHu/dbauto/cursor/fix-mysql84-temp-password-order-cded/deployments/%E6%95%B0%E6%8D%AE%E5%BA%93%E9%83%A8%E7%BD%B2%E8%84%9A%E6%9C%AC/output/mysql84-gtid-primary-replicas-3node-083102.yaml
+
 ## 重跑
 
 虚机可保留；若上次卡在改密前，用修复后的 YAML 直接重跑即可。
