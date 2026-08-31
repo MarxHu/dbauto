@@ -96,11 +96,21 @@ phases:
       - action: start_mysqld
         service: mysqld
 
-  - name: 启动后验收
-    description: 建复制前 fail-fast，避免 gtid_mode=OFF 时走到 1777
+  - name: 临时密码改密
+    description: >
+      MySQL 8.4 临时密码态仅允许 ALTER USER（ERROR 1820）。
+      此阶段必须早于任何 SELECT/验收语句。
     auth:
       user: root
       password_source: temporary_from_mysqld_log
+    sql:
+      - statement: "ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ params.root_password }}';"
+
+  - name: 启动后验收
+    description: 改密后 fail-fast 验收 GTID 与 server_id，避免建复制时 1777
+    auth:
+      user: root
+      password: "{{ params.root_password }}"
     checks:
       - query: "SELECT @@GLOBAL.gtid_mode;"
         expect: "ON"
@@ -109,22 +119,15 @@ phases:
       - query: "SELECT @@GLOBAL.server_id;"
         expect: "{{ host.server_id }}"
 
-  - name: 临时密码改密
-    description: MySQL 8.4 临时密码登录后须先 ALTER USER（ERROR 1820）
-    auth:
-      user: root
-      password_source: temporary_from_mysqld_log
-    sql:
-      - statement: "ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ params.root_password }}';"
-      - statement: "SET SESSION sql_log_bin = 0;"
-      - statement: "SELECT @@global.gtid_executed;"
-
   - name: 主库创建复制用户
     when: "host.role == 'primary'"
     auth:
       user: root
       password: "{{ params.root_password }}"
     sql:
+      - statement: "SET SESSION sql_log_bin = 0;"
+        comment: 初始化语句不写 binlog
+      - statement: "SELECT @@global.gtid_executed;"
       - statement: "CREATE USER IF NOT EXISTS '{{ params.repl_user }}'@'%' IDENTIFIED BY '{{ params.repl_password }}';"
       - statement: "GRANT REPLICATION SLAVE ON *.* TO '{{ params.repl_user }}'@'%';"
       - statement: "FLUSH PRIVILEGES;"
