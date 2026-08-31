@@ -81,23 +81,15 @@ if [[ "${INJECT_BACKEND}" == "docker" ]]; then
       if docker_cmd_check "${ctn}" stress-ng; then
         ok "stress-ng in ${ctn}"
       else
-        bad "stress-ng missing in ${ctn} (install in image for CPU/memory faults)"
+        bad "stress-ng missing in ${ctn} (NODE_SPEC required)"
       fi
-      if docker_cmd_check "${ctn}" vmstat; then
-        ok "vmstat in ${ctn}"
-      else
-        warn "vmstat missing in ${ctn} (CPU post-check may fail)"
-      fi
-      if docker_cmd_check "${ctn}" iptables; then
-        ok "iptables in ${ctn}"
-      else
-        warn "iptables missing in ${ctn} (network faults F20/F30 need it, or use host netns)"
-      fi
-      if docker_cmd_check "${ctn}" tc; then
-        ok "tc in ${ctn}"
-      else
-        warn "tc missing in ${ctn} (packet-loss F22 needs it)"
-      fi
+      for req in vmstat chmod dd iptables tc; do
+        if docker_cmd_check "${ctn}" "${req}"; then
+          ok "${req} in ${ctn}"
+        else
+          bad "${req} missing in ${ctn} (NODE_SPEC required)"
+        fi
+      done
     else
       bad "no docker container for ${host} (set REDIS_CONTAINER_MAP=\"${host}:<name> ...\" or REDIS_CONTAINERS)"
     fi
