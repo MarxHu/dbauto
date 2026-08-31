@@ -21,10 +21,15 @@ MySQL 8.4 临时密码态 **只允许 ALTER USER**，因此：
 
 YAML 已改为用 `performance_schema` 单值查询（`-N` 下也能比），不再依赖 `wait_replication`。
 
-若要改 runner：对 `\G` 输出不要加 `-N`，或改为：
+## assert_sql 坑：RECEIVED == gtid_executed
 
-```bash
-mysql -Nse "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1"
+从库 `gtid_executed` = **本机 initialize UUID:1** + **主库传来的 UUID:…**；
+`RECEIVED_TRANSACTION_SET` 只有主库传来的部分。二者 **天然不相等**，用相等判断会误杀（got=1 expect=0）。
+
+正确用法：
+
+```sql
+SELECT GTID_SUBSET(RECEIVED_TRANSACTION_SET, @@GLOBAL.gtid_executed);  -- 期望 1
 ```
 
 ## 现有失败现场（复制已通、保护未装）——不重置

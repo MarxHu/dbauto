@@ -169,11 +169,13 @@ phases:
             expect: "ON"
             comment: 等价 Replica_SQL_Running=Yes
           - query: >
-              SELECT IF(
-                (SELECT RECEIVED_TRANSACTION_SET FROM performance_schema.replication_connection_status LIMIT 1)
-                = @@GLOBAL.gtid_executed, 0, 1);
-            expect: "0"
-            comment: 收到的 GTID 已应用到本机，等价 behind=0
+              SELECT GTID_SUBSET(
+                (SELECT RECEIVED_TRANSACTION_SET FROM performance_schema.replication_connection_status LIMIT 1),
+                @@GLOBAL.gtid_executed);
+            expect: "1"
+            comment: >
+              收到的 GTID 必须是 gtid_executed 的子集即可；不能用相等判断。
+              从库 gtid_executed 还含本机 initialize 的 UUID:1，与 RECEIVED 天然不相等。
 
       - action: run_sql
         when: "host.role == 'replica'"
