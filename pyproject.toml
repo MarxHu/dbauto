@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbauto"
+version = "0.1.0"
+description = "A lightweight, dependency-free database migration and automation CLI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "dbauto contributors" }]
+keywords = ["database", "migrations", "sqlite", "automation", "cli"]
+dependencies = [
+  "click==8.1.7",
+  "rich==13.7.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.2.0",
+]
+
+[project.scripts]
+dbauto = "dbauto.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

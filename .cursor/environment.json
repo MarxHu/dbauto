@@ -1,0 +1,4 @@
+{
+  "name": "dbauto",
+  "install": "python3 -m pip install --user --upgrade pip && python3 -m pip install --user -e '.[dev]'"
+}
