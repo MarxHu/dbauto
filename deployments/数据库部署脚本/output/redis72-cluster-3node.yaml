@@ -1,161 +1,873 @@
-# Redis 7.2 Cluster 三主（3 节点）二进制部署流程
-# 部署方式：各节点执行 shell 脚本；从 Redis 官方开源地址下载源码包编译安装
-# 拓扑：172.30.0.11 / .12 / .13 各为一个 master shard（--cluster-replicas 0）
-# 默认密码：Redis@1314
-# 定位：自动化测试用标准集群（不要求 HA）
+---
+schema_version: v1
+meta:
+  name: Redis Cluster三节点部署
+  id: redis72-cluster
+  description: 二进制编译安装Redis 7.2.16 Cluster三主零从，适用于自动化测试（不要求HA）。
+spec:
+  nodes:
+  - id: redis72-cluster_node1
+    type: EmptyStartEvent
+    next:
+    - redis72-cluster_node2
+  - id: redis72-cluster_node2
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 环境预检
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
 
-apiVersion: dbauto/v1
-kind: RedisClusterDeployment
-metadata:
-  name: redis72-cluster-3node
-  redis_version: "7.2.16"
-  topology: redis-cluster
-  deploy_mode: binary
+            # ===== 项目默认配置开始 =====
+            redis_port="6379"
+            cluster_bus_port="16379"
+            nofile_min="65535"
+            required_commands="gcc make tclsh curl tar sha256sum ss pgrep systemctl"
+            # ===== 项目默认配置结束 =====
 
-parameters:
-  redis_password:
-    description: Redis 集群认证密码（requirepass / masterauth）
-    default: "Redis@1314"
-  redis_port:
-    description: Redis 服务端口
-    default: 6379
-  cluster_bus_port:
-    description: Cluster 总线端口（服务端口 + 10000）
-    default: 16379
-  cluster_node_timeout_ms:
-    description: 集群节点超时（毫秒）
-    default: 15000
-  cluster_replicas:
-    description: 每个 master 的 replica 数；三主零从填 0
-    default: 0
-  install_prefix:
-    description: 二进制安装目录
-    default: "/opt/redis/7.2.16"
-  wait_timeout_sec:
-    description: 等待各节点就绪超时（秒）
-    default: 120
+            node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][环境预检][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][环境预检][$target_ip] $*"; }
+            local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
+            target_ip=""
+            for ip in "$node1" "$node2" "$node3"; do
+              [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
+            done
+            [[ -n "$target_ip" ]] || error "本机IP不在节点列表中: ${node1},${node2},${node3}"
 
-packages:
-  redis:
-    version: "7.2.16"
-    format: tarball-source
-    tarball_url: https://download.redis.io/releases/redis-7.2.16.tar.gz
-    tarball_sha256: 960a8ec15e34ff40e57ff16837b26b33bd81f2da6d24497bb63de532a323a18e
-    hash_index_url: https://github.com/redis/redis-hashes
-    github_release_url: https://github.com/redis/redis/releases/tag/7.2.16
-    github_source_tarball: https://github.com/redis/redis/archive/refs/tags/7.2.16.tar.gz
-    stable_tarball_url: https://download.redis.io/redis-stable.tar.gz
-    install_method: compile
-    install_prefix: "{{ params.install_prefix }}"
-    build_deps:
-      - gcc
-      - make
-      - tcl
-      - wget
-      - curl
-      - tar
+            [[ $(id -u) -eq 0 ]] || error "必须由root作业账户执行"
+            valid_ip() {
+              local ip=$1 part
+              [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+              IFS=. read -r -a parts <<<"$ip"
+              for part in "${parts[@]}"; do ((part >= 0 && part <= 255)) || return 1; done
+            }
+            valid_ip "$target_ip" || error "目标IP非法"
 
-hosts:
-  - ip: 172.30.0.11
-    role: cluster-node
-    node_id: node-11
-  - ip: 172.30.0.12
-    role: cluster-node
-    node_id: node-12
-  - ip: 172.30.0.13
-    role: cluster-node
-    node_id: node-13
+            read -r -a commands <<<"$required_commands"
+            missing_commands=()
+            for command in "${commands[@]}"; do
+              command -v "$command" >/dev/null 2>&1 || missing_commands+=("$command")
+            done
+            ((${#missing_commands[@]} == 0)) || error "缺少必需命令: ${missing_commands[*]}"
 
-scripts_dir: deployments/数据库部署脚本/scripts/redis72-cluster-3node
+            for port in "$redis_port" "$cluster_bus_port"; do
+              ss -lnt | awk '{print $4}' | grep -q ":${port}$" && error "端口 ${port} 已被占用"
+            done
 
-phases:
-  - name: 环境预检
-    run_on: all
-    script: "{{ scripts_dir }}/01-precheck.sh"
-    env:
-      REDIS_PORT: "{{ params.redis_port }}"
-      CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
+            current_nofile=$(ulimit -n)
+            (( current_nofile >= nofile_min )) || error "ulimit -n=${current_nofile}，需要 >= ${nofile_min}"
 
-  - name: 内核参数
-    run_on: all
-    script: "{{ scripts_dir }}/02-sysctl.sh"
+            pgrep -x redis-server >/dev/null 2>&1 && error "已存在 redis-server 进程，请先清理"
+            info "环境预检通过"
+        job_ip_list:
+          value: "${redis_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_node2_ip}' '${redis_node3_ip}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '1800'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node3
+  - id: redis72-cluster_node3
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 内核参数
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
 
-  - name: 防火墙放行
-    description: 本机放行 6379/16379（firewalld 或 ufw）
-    run_on: all
-    script: "{{ scripts_dir }}/03-network-firewall.sh"
-    env:
-      REDIS_PORT: "{{ params.redis_port }}"
-      CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
+            node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][内核参数][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][内核参数][$target_ip] $*"; }
+            local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
+            target_ip=""
+            for ip in "$node1" "$node2" "$node3"; do
+              [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
+            done
+            [[ -n "$target_ip" ]] || error "本机IP不在节点列表中"
 
-  - name: 下载编译安装二进制
-    run_on: all
-    script: "{{ scripts_dir }}/04-install-binary.sh"
-    env:
-      REDIS_VERSION: "{{ packages.redis.version }}"
-      REDIS_TARBALL_URL: "{{ packages.redis.tarball_url }}"
-      REDIS_TARBALL_SHA256: "{{ packages.redis.tarball_sha256 }}"
-      INSTALL_PREFIX: "{{ params.install_prefix }}"
+            sysctl -w vm.overcommit_memory=1 >/dev/null
+            mkdir -p /etc/sysctl.d
+            cat > /etc/sysctl.d/99-redis.conf <<'EOF'
+            vm.overcommit_memory = 1
+            EOF
+            sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-redis.conf >/dev/null
 
-  - name: 生成配置与 systemd
-    run_on: all
-    script: "{{ scripts_dir }}/05-configure.sh"
-    env:
-      REDIS_VERSION: "{{ packages.redis.version }}"
-      INSTALL_PREFIX: "{{ params.install_prefix }}"
-      REDIS_PASSWORD: "{{ params.redis_password }}"
-      REDIS_PORT: "{{ params.redis_port }}"
-      CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
-      CLUSTER_NODE_TIMEOUT_MS: "{{ params.cluster_node_timeout_ms }}"
-      NODE_IP: "{{ host.ip }}"
+            for thp_path in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do
+              if [[ -f "$thp_path" ]]; then
+                echo never > "$thp_path" 2>/dev/null || info "WARN: 无法写入 ${thp_path}"
+              fi
+            done
 
-  - name: 启动 redis-server
-    run_on: all
-    script: "{{ scripts_dir }}/06-start.sh"
+            current=$(sysctl -n vm.overcommit_memory 2>/dev/null || echo 0)
+            [[ "$current" == "1" ]] || error "vm.overcommit_memory=${current}，需要为 1"
+            info "sysctl 配置完成"
+        job_ip_list:
+          value: "${redis_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_node2_ip}' '${redis_node3_ip}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node4
+  - id: redis72-cluster_node4
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 防火墙放行
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
 
-  - name: 等待全部节点就绪
-    description: 从 11 检查三节点 6379/16379 连通与 PING
-    run_on: 172.30.0.11
-    script: "{{ scripts_dir }}/07-wait-nodes.sh"
-    env:
-      REDIS_VERSION: "{{ packages.redis.version }}"
-      INSTALL_PREFIX: "{{ params.install_prefix }}"
-      REDIS_PASSWORD: "{{ params.redis_password }}"
-      REDIS_PORT: "{{ params.redis_port }}"
-      CLUSTER_BUS_PORT: "{{ params.cluster_bus_port }}"
-      WAIT_TIMEOUT_SEC: "{{ params.wait_timeout_sec }}"
-      NODE1: 172.30.0.11
-      NODE2: 172.30.0.12
-      NODE3: 172.30.0.13
+            node1=$1; node2=$2; node3=$3
+            redis_port=$4
+            cluster_bus_port=$5
+            error() { echo "[ERROR][防火墙放行][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][防火墙放行][$target_ip] $*"; }
+            local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
+            target_ip=""
+            for ip in "$node1" "$node2" "$node3"; do
+              [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
+            done
+            [[ -n "$target_ip" ]] || error "本机IP不在节点列表中"
 
-  - name: 创建三主集群
-    run_on: 172.30.0.11
-    script: "{{ scripts_dir }}/08-cluster-create.sh"
-    env:
-      REDIS_VERSION: "{{ packages.redis.version }}"
-      INSTALL_PREFIX: "{{ params.install_prefix }}"
-      REDIS_PASSWORD: "{{ params.redis_password }}"
-      REDIS_PORT: "{{ params.redis_port }}"
-      CLUSTER_REPLICAS: "{{ params.cluster_replicas }}"
-      NODE1: 172.30.0.11
-      NODE2: 172.30.0.12
-      NODE3: 172.30.0.13
+            open_firewall_port() {
+              local port=$1
+              if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+                firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null
+                firewall-cmd --reload >/dev/null
+                info "firewalld 已放行 ${port}/tcp"
+              elif command -v ufw >/dev/null 2>&1 && ufw status | grep -qi active; then
+                ufw allow "${port}/tcp" >/dev/null
+                info "ufw 已放行 ${port}/tcp"
+              else
+                info "未检测到 active 的 firewalld/ufw，跳过本地防火墙配置"
+              fi
+            }
 
-  - name: 部署验收
-    run_on: all
-    script: "{{ scripts_dir }}/09-verify.sh"
-    env:
-      REDIS_VERSION: "{{ packages.redis.version }}"
-      INSTALL_PREFIX: "{{ params.install_prefix }}"
-      REDIS_PASSWORD: "{{ params.redis_password }}"
-      REDIS_PORT: "{{ params.redis_port }}"
-      NODE1: 172.30.0.11
+            open_firewall_port "$redis_port"
+            open_firewall_port "$cluster_bus_port"
+            info "本机防火墙配置完成"
+        job_ip_list:
+          value: "${redis_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_node2_ip}' '${redis_node3_ip}' '${redis_port}'
+            '${redis_cluster_bus_port}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node5
+  - id: redis72-cluster_node5
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 下载编译安装
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
 
-# 手工部署顺序（三台 01-06，11 上 07-08，三台 09）：
-# export REDIS_PASSWORD='Redis@1314'
-# bash 01-precheck.sh && bash 02-sysctl.sh && bash 03-network-firewall.sh
-# bash 04-install-binary.sh && bash 05-configure.sh && bash 06-start.sh
-# # 172.30.0.11：
-# bash 07-wait-nodes.sh && bash 08-cluster-create.sh
-# # 三台：
-# bash 09-verify.sh
+            node1=$1; node2=$2; node3=$3
+            redis_version=$4
+            tarball_url=$5
+            tarball_sha256=$6
+            install_prefix=$7
+            work_dir="/tmp/redis-build"
+            parallel=$(nproc)
+
+            error() { echo "[ERROR][下载编译安装][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][下载编译安装][$target_ip] $*"; }
+            local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
+            target_ip=""
+            for ip in "$node1" "$node2" "$node3"; do
+              [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
+            done
+            [[ -n "$target_ip" ]] || error "本机IP不在节点列表中"
+
+            if [[ -x "${install_prefix}/bin/redis-server" ]]; then
+              info "已安装 ${install_prefix}/bin/redis-server，跳过"
+              exit 0
+            fi
+
+            mkdir -p "$work_dir" "$install_prefix"
+            cd "$work_dir"
+            tarball="redis-${redis_version}.tar.gz"
+            if [[ ! -f "$tarball" ]]; then
+              info "下载 ${tarball_url}"
+              curl -fsSL "$tarball_url" -o "$tarball"
+            fi
+            [[ -n "$tarball_sha256" ]] || error "未配置 tar.gz SHA256"
+            echo "${tarball_sha256}  ${tarball}" | sha256sum -c -
+
+            rm -rf "redis-${redis_version}"
+            tar -xzf "$tarball"
+            cd "redis-${redis_version}"
+            make -j"${parallel}" BUILD_TLS=no
+            make PREFIX="${install_prefix}" install
+            "${install_prefix}/bin/redis-server" --version
+            info "二进制安装完成: ${install_prefix}"
+        job_ip_list:
+          value: "${redis_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_node2_ip}' '${redis_node3_ip}' '${redis_version}'
+            '${redis_tarball_url}' '${redis_tarball_sha256}' '${redis_install_prefix}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '3600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node6
+  - id: redis72-cluster_node6
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 生成配置与systemd
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+
+            node1=$1; node2=$2; node3=$3
+            redis_version=$4
+            install_prefix=$5
+            redis_password=$6
+            redis_port=$7
+            cluster_bus_port=$8
+            cluster_node_timeout_ms=$9
+
+            conf_dir="/etc/redis"
+            data_dir="/var/lib/redis/${redis_port}"
+            log_dir="/var/log/redis"
+
+            error() { echo "[ERROR][生成配置与systemd][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][生成配置与systemd][$target_ip] $*"; }
+            local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
+            target_ip=""
+            for ip in "$node1" "$node2" "$node3"; do
+              [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
+            done
+            [[ -n "$target_ip" ]] || error "本机IP不在节点列表中"
+
+            mkdir -p "$conf_dir" "$data_dir" "$log_dir"
+            cat > "${conf_dir}/redis.conf" <<EOF
+            bind 0.0.0.0
+            port ${redis_port}
+            protected-mode yes
+            daemonize no
+            supervised systemd
+            pidfile /var/run/redis_${redis_port}.pid
+            logfile ${log_dir}/redis.log
+            dir ${data_dir}
+            appendonly yes
+            appendfsync everysec
+            requirepass ${redis_password}
+            masterauth ${redis_password}
+            tcp-keepalive 300
+            timeout 0
+            maxmemory-policy noeviction
+            cluster-enabled yes
+            cluster-config-file nodes-${redis_port}.conf
+            cluster-node-timeout ${cluster_node_timeout_ms}
+            cluster-require-full-coverage yes
+            cluster-announce-ip ${target_ip}
+            cluster-announce-port ${redis_port}
+            cluster-announce-bus-port ${cluster_bus_port}
+            EOF
+
+            cat > /etc/systemd/system/redis.service <<EOF
+            [Unit]
+            Description=Redis ${redis_version} Cluster Node
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=simple
+            User=root
+            Group=root
+            Environment=REDISCLI_AUTH=${redis_password}
+            ExecStart=${install_prefix}/bin/redis-server ${conf_dir}/redis.conf
+            ExecStop=${install_prefix}/bin/redis-cli -p ${redis_port} shutdown
+            Restart=always
+            RestartSec=3
+            LimitNOFILE=65535
+            TimeoutStartSec=120
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable redis
+            info "配置写入 ${conf_dir}/redis.conf"
+        job_ip_list:
+          value: "${redis_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_node2_ip}' '${redis_node3_ip}' '${redis_version}'
+            '${redis_install_prefix}' '${redis_password}' '${redis_port}' '${redis_cluster_bus_port}'
+            '${redis_cluster_node_timeout_ms}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node7
+  - id: redis72-cluster_node7
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 启动redis-server
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+
+            node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][启动redis-server][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][启动redis-server][$target_ip] $*"; }
+            local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
+            target_ip=""
+            for ip in "$node1" "$node2" "$node3"; do
+              [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
+            done
+            [[ -n "$target_ip" ]] || error "本机IP不在节点列表中"
+
+            systemctl restart redis
+            sleep 2
+            systemctl is-active --quiet redis || error "redis.service 未 active"
+            info "redis.service active"
+        job_ip_list:
+          value: "${redis_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_node2_ip}' '${redis_node3_ip}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node8
+  - id: redis72-cluster_node8
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 等待全部节点就绪
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+
+            node1=$1; node2=$2; node3=$3
+            install_prefix=$4
+            redis_password=$5
+            redis_port=$6
+            cluster_bus_port=$7
+            wait_timeout_sec=$8
+
+            cli="${install_prefix}/bin/redis-cli"
+            export REDISCLI_AUTH="${redis_password}"
+            error() { echo "[ERROR][等待全部节点就绪] $*" >&2; exit 1; }
+            info() { echo "[INFO][等待全部节点就绪] $*"; }
+
+            wait_node() {
+              local host=$1
+              local deadline=$((SECONDS + wait_timeout_sec))
+              while (( SECONDS < deadline )); do
+                if timeout 3 bash -c "echo >/dev/tcp/${host}/${redis_port}" 2>/dev/null \
+                  && timeout 3 bash -c "echo >/dev/tcp/${host}/${cluster_bus_port}" 2>/dev/null \
+                  && "$cli" -h "$host" -p "$redis_port" PING 2>/dev/null | grep -q PONG; then
+                  info "${host} 就绪"
+                  return 0
+                fi
+                sleep 2
+              done
+              error "等待 ${host} 超时 (${wait_timeout_sec}s)"
+            }
+
+            for node in "$node1" "$node2" "$node3"; do
+              wait_node "$node"
+            done
+            info "全部节点已就绪"
+        job_ip_list:
+          value: "${redis_node1_ip}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_node2_ip}' '${redis_node3_ip}' '${redis_install_prefix}'
+            '${redis_password}' '${redis_port}' '${redis_cluster_bus_port}' '${redis_wait_timeout_sec}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '1800'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node9
+  - id: redis72-cluster_node9
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 创建三主集群
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+
+            node1=$1; node2=$2; node3=$3
+            install_prefix=$4
+            redis_password=$5
+            redis_port=$6
+            cluster_replicas=$7
+
+            cli="${install_prefix}/bin/redis-cli"
+            export REDISCLI_AUTH="${redis_password}"
+            error() { echo "[ERROR][创建三主集群] $*" >&2; exit 1; }
+            info() { echo "[INFO][创建三主集群] $*"; }
+
+            cluster_state=$("$cli" -h "$node1" -p "$redis_port" CLUSTER INFO 2>/dev/null | awk -F: '/cluster_state/ {print $2}' | tr -d '\r' || true)
+            if [[ "$cluster_state" == "ok" ]]; then
+              info "集群已是 cluster_state:ok，跳过 create"
+              exit 0
+            fi
+
+            info "执行 redis-cli --cluster create（三主零从）"
+            "$cli" --cluster create \
+              "${node1}:${redis_port}" \
+              "${node2}:${redis_port}" \
+              "${node3}:${redis_port}" \
+              --cluster-replicas "$cluster_replicas" \
+              --cluster-yes
+            info "集群创建完成"
+        job_ip_list:
+          value: "${redis_node1_ip}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_node2_ip}' '${redis_node3_ip}' '${redis_install_prefix}'
+            '${redis_password}' '${redis_port}' '${redis_cluster_replicas}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '1800'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node10
+  - id: redis72-cluster_node10
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 部署验收
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+
+            node1=$1
+            install_prefix=$2
+            redis_password=$3
+            redis_port=$4
+
+            cli="${install_prefix}/bin/redis-cli"
+            export REDISCLI_AUTH="${redis_password}"
+            error() { echo "[ERROR][部署验收] $*" >&2; exit 1; }
+            info() { echo "[INFO][部署验收] $*"; }
+
+            info=$("$cli" -h "$node1" -p "$redis_port" CLUSTER INFO)
+            printf '%s\n' "$info"
+            grep -q "cluster_state:ok" <<<"$info" || error "cluster_state 非 ok"
+            grep -q "cluster_slots_assigned:16384" <<<"$info" || error "slots 未分满"
+            grep -q "cluster_known_nodes:3" <<<"$info" || error "节点数不是 3"
+
+            nodes=$("$cli" -h "$node1" -p "$redis_port" CLUSTER NODES)
+            master_count=$(awk '$3 ~ /master/ && $3 !~ /fail/ {c++} END {print c+0}' <<<"$nodes")
+            [[ "$master_count" == "3" ]] || error "master 数量=${master_count}，期望 3"
+
+            "$cli" -c -h "$node1" -p "$redis_port" SET '{deploy}:cluster:verify' ok | grep -q OK
+            for key in sops:verify:node11 sops:verify:node12 sops:verify:node13; do
+              "$cli" -c -h "$node1" -p "$redis_port" SET "$key" ok | grep -q OK
+            done
+            "$cli" -c -h "$node1" -p "$redis_port" DEL '{deploy}:cluster:verify' \
+              sops:verify:node11 sops:verify:node12 sops:verify:node13 >/dev/null
+            info "验收通过"
+        job_ip_list:
+          value: "${redis_node1_ip}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${redis_node1_ip}' '${redis_install_prefix}' '${redis_password}' '${redis_port}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - redis72-cluster_node11
+  - id: redis72-cluster_node11
+    type: EmptyEndEvent
+  constants:
+    "${redis_node1_ip}":
+      name: Redis节点1 IP
+      value: 172.30.0.11
+      type: input
+      validation: "^[0-9.]+$"
+    "${redis_node2_ip}":
+      name: Redis节点2 IP
+      value: 172.30.0.12
+      type: input
+      validation: "^[0-9.]+$"
+    "${redis_node3_ip}":
+      name: Redis节点3 IP
+      value: 172.30.0.13
+      type: input
+      validation: "^[0-9.]+$"
+    "${redis_node_ips}":
+      name: Redis三节点IP列表
+      value: 172.30.0.11,172.30.0.12,172.30.0.13
+      type: input
+      validation: "^[0-9.,]+$"
+    "${redis_password}":
+      name: Redis集群密码
+      value: Redis@1314
+      type: input
+      validation: ^[^'"\s]{8,128}$
+    "${redis_port}":
+      name: Redis服务端口
+      value: '6379'
+      type: input
+      validation: "^[0-9]+$"
+    "${redis_cluster_bus_port}":
+      name: Cluster总线端口
+      value: '16379'
+      type: input
+      validation: "^[0-9]+$"
+    "${redis_cluster_node_timeout_ms}":
+      name: 集群节点超时毫秒
+      value: '15000'
+      type: input
+      validation: "^[0-9]+$"
+    "${redis_cluster_replicas}":
+      name: 每master副本数
+      value: '0'
+      type: input
+      validation: "^[0-9]+$"
+    "${redis_version}":
+      name: Redis版本
+      value: 7.2.16
+      type: input
+      validation: "^[0-9.]+$"
+    "${redis_install_prefix}":
+      name: 二进制安装目录
+      value: /opt/redis/7.2.16
+      type: input
+      validation: "^/.+"
+    "${redis_tarball_url}":
+      name: Redis官方tar.gz下载地址
+      value: https://download.redis.io/releases/redis-7.2.16.tar.gz
+      type: input
+      validation: "^https?://.+"
+    "${redis_tarball_sha256}":
+      name: Redis tar.gz SHA256
+      value: 960a8ec15e34ff40e57ff16837b26b33bd81f2da6d24497bb63de532a323a18e
+      type: input
+      validation: "^[0-9A-Fa-f]{64}$"
+    "${redis_wait_timeout_sec}":
+      name: 等待节点就绪超时秒
+      value: '120'
+      type: input
+      validation: "^[0-9]+$"
