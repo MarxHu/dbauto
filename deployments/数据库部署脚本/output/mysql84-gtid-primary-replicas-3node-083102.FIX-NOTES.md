@@ -1,77 +1,38 @@
-# mysql84-gtid-primary-replicas-3node-083102 修复与加固说明
+# mysql84-gtid-primary-replicas-3node-083102 部署说明（全新节点版）
 
-## 1. 临时密码阶段（ERROR 1820）
+## 适用场景
 
-临时密码登录后须先 `ALTER USER`，再执行其它 SQL。
+**全新虚机 / 空 datadir** 的一主两从 GTID 部署测试。不适用于已有坏 datadir 的就地修复。
 
-```sql
-ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ root_password }}';
-SET SESSION sql_log_bin = 0;
-SELECT @@global.gtid_executed;
+## 相对旧版的关键变化
+
+| 问题 | 旧版 | 新版 |
+|------|------|------|
+| cnf 未加载 | 只写 `my.cnf.d`，主配置无 includedir | 先 `ensure_mycnf_includedir` |
+| ERROR 1777 | init 时 GTID 实际 OFF | init 前写入 GTID cnf + 启动后验收 |
+| init 报 unknown variable | cnf 含半同步变量 | init cnf 仅 GTID/server_id；半同步运行期 SQL |
+| ERROR 1820 | 改密前跑 SELECT | 先 ALTER USER |
+| ERROR 2061 | 缺 GET_SOURCE_PUBLIC_KEY | 已包含 |
+
+## init 配置（/etc/my.cnf.d/mysql-cluster.cnf）
+
+**主库**：`server-id`、`gtid_mode`、`enforce_gtid_consistency`、`log_bin`、`binlog_format`、`log_replica_updates`
+
+**从库**：`server-id`、`gtid_mode`、`enforce_gtid_consistency`、`log_replica_updates`、`relay_log`、`replica_preserve_commit_order`
+
+**不含**：`plugin_load_add`、`rpl_semi_sync_*`、`read_only`（从库只读在复制就绪后 SET GLOBAL）
+
+## 部署前检查
+
+- 三台均为 **全新节点**，`/var/lib/mysql` 为空或不存在
+- 无残留 `mariadb-libs`（预检会自动卸无依赖包）
+- 参数已填：`root_password`、`repl_password`
+
+## 下载
+
+https://raw.githubusercontent.com/MarxHu/dbauto/cursor/fix-mysql84-temp-password-order-cded/deployments/%E6%95%B0%E6%8D%AE%E5%BA%93%E9%83%A8%E7%BD%B2%E8%84%9A%E6%9C%AC/output/mysql84-gtid-primary-replicas-3node-083102.yaml
+
+```bash
+curl -L -o mysql84-gtid-primary-replicas-3node-083102.yaml \
+  "https://raw.githubusercontent.com/MarxHu/dbauto/cursor/fix-mysql84-temp-password-order-cded/deployments/%E6%95%B0%E6%8D%AE%E5%BA%93%E9%83%A8%E7%BD%B2%E8%84%9A%E6%9C%AC/output/mysql84-gtid-primary-replicas-3node-083102.yaml"
 ```
-
-## 2. 从库复制认证（ERROR 2061）
-
-无 SSL 复制时，`CHANGE REPLICATION SOURCE TO` 须加 `GET_SOURCE_PUBLIC_KEY=1`。
-
-## 3. 从库只读保护
-
-从库须设置：
-
-```sql
-SET GLOBAL read_only = ON;
-SET GLOBAL super_read_only = ON;
-```
-
-并在 `my.cnf` 持久化 `read_only=1`、`super_read_only=1`，防止重启后从库可写。
-
-## 4. 半同步复制
-
-| 节点 | 插件 | 运行时变量 |
-|------|------|-----------|
-| 主库 11 | `rpl_semi_sync_source` | `rpl_semi_sync_source_enabled=ON` |
-| 从库 12/13 | `rpl_semi_sync_replica` | `rpl_semi_sync_replica_enabled=ON` |
-
-启用顺序：**先从库、后主库**（避免主库开启半同步时无从库 ACK）。
-
-参数（可在 YAML `parameters` 调整）：
-
-- `semi_sync_wait_replica_count`：默认 `1`（一主两从至少等 1 台 ACK）
-- `semi_sync_timeout_ms`：默认 `10000`
-
-## 5. 已有环境手工加固（不必重建）
-
-若复制已通但保护未配，在 **12/13** 执行：
-
-```sql
-INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';
-SET GLOBAL rpl_semi_sync_replica_enabled = ON;
-SET GLOBAL read_only = ON;
-SET GLOBAL super_read_only = ON;
-```
-
-在 **11** 执行：
-
-```sql
-INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';
-SET GLOBAL rpl_semi_sync_source_wait_for_replica_count = 1;
-SET GLOBAL rpl_semi_sync_source_timeout = 10000;
-SET GLOBAL rpl_semi_sync_source_enabled = ON;
-```
-
-验收：
-
-```sql
--- 从库：应 ON / ON / ON
-SELECT @@read_only, @@super_read_only, @@rpl_semi_sync_replica_enabled;
-
--- 主库：半同步 ON，且 2 条复制连接
-SELECT @@rpl_semi_sync_source_enabled;
-SELECT COUNT(*) FROM performance_schema.replication_connection_status WHERE SERVICE_STATE='ON';
-```
-
-## 文件位置与下载
-
-- 仓库路径：`deployments/数据库部署脚本/output/mysql84-gtid-primary-replicas-3node-083102.yaml`
-- 直接下载（PR 分支 raw）：
-  https://raw.githubusercontent.com/MarxHu/dbauto/cursor/fix-mysql84-temp-password-order-cded/deployments/%E6%95%B0%E6%8D%AE%E5%BA%93%E9%83%A8%E7%BD%B2%E8%84%9A%E6%9C%AC/output/mysql84-gtid-primary-replicas-3node-083102.yaml
