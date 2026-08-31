@@ -30,6 +30,27 @@ SELECT @@global.gtid_executed;
 
 使用 YAML `parameters.root_password`（或你本地模板中的等价变量）作为 `ALTER USER` 的目标密码。
 
+## 问题 2：从库复制 IO 报 2061
+
+MySQL 8 默认复制用户认证插件为 `caching_sha2_password`。复制链路未启用 SSL 时，从库 IO 线程会报：
+
+```
+ERROR 2061 (HY000): Authentication plugin 'caching_sha2_password' reported error: Authentication requires secure connection.
+```
+
+## 修复（从库 CHANGE REPLICATION SOURCE TO）
+
+在 `CHANGE REPLICATION SOURCE TO` 中增加 `GET_SOURCE_PUBLIC_KEY=1`，让从库向主库索取 RSA 公钥完成密码认证：
+
+```sql
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST='172.30.0.11',
+  SOURCE_USER='repl',
+  SOURCE_PASSWORD='...',
+  SOURCE_AUTO_POSITION=1,
+  GET_SOURCE_PUBLIC_KEY=1;
+```
+
 ## 文件位置与下载
 
 - 仓库路径：`deployments/数据库部署脚本/output/mysql84-gtid-primary-replicas-3node-083102.yaml`

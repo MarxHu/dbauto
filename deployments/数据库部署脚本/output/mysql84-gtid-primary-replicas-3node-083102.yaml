@@ -1,5 +1,7 @@
 # MySQL 8.4 GTID 一主两从（3 节点）部署流程
-# 修复：临时密码阶段须先 ALTER USER，再执行其它 SQL（MySQL 8.4 ERROR 1820）
+# 修复：
+# - 临时密码阶段须先 ALTER USER，再执行其它 SQL（MySQL 8.4 ERROR 1820）
+# - 从库复制须 GET_SOURCE_PUBLIC_KEY=1（caching_sha2_password 无 SSL 时 ERROR 2061）
 
 apiVersion: dbauto/v1
 kind: MySQLClusterDeployment
@@ -90,5 +92,7 @@ phases:
           SOURCE_HOST='172.30.0.11',
           SOURCE_USER='{{ params.repl_user }}',
           SOURCE_PASSWORD='{{ params.repl_password }}',
-          SOURCE_AUTO_POSITION=1;
+          SOURCE_AUTO_POSITION=1,
+          GET_SOURCE_PUBLIC_KEY=1;
+        comment: MySQL 8 默认 caching_sha2_password，无 SSL 复制须向主库索取 RSA 公钥
       - statement: "START REPLICA;"
