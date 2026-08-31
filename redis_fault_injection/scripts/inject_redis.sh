@@ -44,6 +44,7 @@ Actions:
   cache-penetrate    Burst GET on missing keys
   error-pulse        NOAUTH/WRONGPASS/MOVED/CROSSSLOT bounded pulse
   historical-misconf One-shot seed historical MISCONF counter (no auto state restore)
+  historical-misconf-cleanup  Restore config and restart redis to clear ERRORSTATS (recommended after F29/C01)
 
 Extra options:
   --maxmemory <size>       default 64mb
@@ -259,7 +260,7 @@ case "${ACTION}" in
     while (( SECONDS < end_time )) && (( count < PULSE_MAX )); do
       case "${ERROR_TYPE}" in
         NOAUTH)
-          redis-cli --no-auth-warning -h "${host}" -p "${port}" PING >/dev/null 2>&1 || true
+          env -u REDISCLI_AUTH redis-cli --no-auth-warning -h "${host}" -p "${port}" PING >/dev/null 2>&1 || true
           ;;
         WRONGPASS)
           redis-cli --no-auth-warning -h "${host}" -p "${port}" \
@@ -280,9 +281,12 @@ case "${ACTION}" in
     [[ -n "${after}" ]] && log "after errorstats: ${after}"
     ;;
   historical-misconf)
-    log "seed historical MISCONF on ${NODE} (persistent until manual cleanup/restart)"
+    log "seed historical MISCONF on ${NODE}"
     before="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF || echo 'MISCONF:0')"
     log "before: ${before}"
+    orig_stop="$(redis_cmd "${NODE}" CONFIG GET stop-writes-on-bgsave-error | awk 'NR==2{print}')"
+    orig_stop="${orig_stop:-yes}"
+    save_misconf_state "${NODE}" stop_writes "${orig_stop}"
     redis_cmd "${NODE}" CONFIG SET stop-writes-on-bgsave-error yes >/dev/null 2>&1 || \
       die "cannot set stop-writes-on-bgsave-error on ${NODE}"
     run_on_target "chmod -R a-w ${REDIS_DATA_DIR}"
@@ -293,7 +297,35 @@ case "${ACTION}" in
     persist="$(redis_cmd "${NODE}" INFO PERSISTENCE 2>/dev/null | grep -E 'rdb_last_bgsave_status|aof_last_write_status' || true)"
     log "after: ${after}"
     log "persistence: ${persist}"
-    log "expect for diagnosis bot: cumulative MISCONF > 0, current persistence ok, no new delta during window"
+    log "run historical-misconf-cleanup after test to avoid polluting later scenarios"
+    ;;
+  historical-misconf-cleanup)
+    MISCONF_CLEANUP_RESTART="${MISCONF_CLEANUP_RESTART:-YES}"
+    orig_stop="$(load_misconf_state "${NODE}" stop_writes "yes")"
+    log "restore stop-writes-on-bgsave-error=${orig_stop} on ${NODE}"
+    redis_cmd "${NODE}" CONFIG SET stop-writes-on-bgsave-error "${orig_stop}" >/dev/null 2>&1 || true
+    if [[ "${MISCONF_CLEANUP_RESTART}" == "YES" ]]; then
+      log "restarting redis on ${NODE} to reset ERRORSTATS counters"
+      TARGET_HOST="${TARGET_HOST:-${host}}"
+      run_on_target "
+        redis-cli -h ${host} -p ${port} SHUTDOWN NOSAVE 2>/dev/null || \
+        systemctl stop ${REDIS_SERVICE:-redis} 2>/dev/null || true
+        sleep 2
+        systemctl start ${REDIS_SERVICE:-redis} 2>/dev/null || \
+        redis-server ${REDIS_CONF:-/etc/redis/redis.conf} 2>/dev/null || true
+      "
+      for _ in $(seq 1 30); do
+        if redis_cmd "${NODE}" PING >/dev/null 2>&1; then
+          break
+        fi
+        sleep 1
+      done
+      redis_cmd "${NODE}" PING >/dev/null || die "redis did not come back on ${NODE}"
+    fi
+    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF || echo 'MISCONF:0')"
+    log "after cleanup: ${after}"
+    clear_misconf_state "${NODE}"
+    log "historical MISCONF background cleared"
     ;;
   *)
     usage

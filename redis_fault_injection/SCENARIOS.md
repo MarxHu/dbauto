@@ -54,10 +54,11 @@ cp config.env.example config.env
 | F18 | 缓存穿透 | `./scripts/inject_redis.sh --action cache-penetrate --node ... --duration 600` |
 | F19 | 协议脉冲 | `./scripts/inject_redis.sh --action error-pulse --node ... --error-type NOAUTH` |
 | F29 | 历史 MISCONF | `./scripts/inject_redis.sh --action historical-misconf --node 10.10.26.146:6381` |
+| F29c | 清理 MISCONF 背景 | `./scripts/inject_redis.sh --action historical-misconf-cleanup --node 10.10.26.146:6381` |
 
-**F19 说明**：有界脉冲固定 `5s × 18 = 90s`（与 V1.2 一致），`--duration` 只限制最大窗口；脚本会打印 pulse 前后 `INFO ERRORSTATS`。
+**F19 说明**：有界脉冲固定 `5s × 18 = 90s`；脚本会打印 pulse 前后 `INFO ERRORSTATS`。
 
-**F29 说明**：先只读数据目录触发 MISCONF，再恢复写权限并 `BGSAVE`；留下历史计数，**不自动清理**（需人工或重启 Redis）。
+**F29 清理**：MISCONF 累计计数需 **重启 Redis** 才能清零。单独 F29 后跑 `historical-misconf-cleanup`；C01 组合在内存 600s 结束后 **自动 cleanup**；跑 F01 基线前务必已清理。
 
 ---
 

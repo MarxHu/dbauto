@@ -45,9 +45,9 @@
 |---|---|---|
 | 拓扑 | 3 Master，端口如 `6381` | 与 `config.env` 中 `REDIS_NODES` 一致 |
 | 连通 | 注入机可 PING 全部节点 | `./scripts/preflight.sh` |
-| 密码 | 若启用 `requirepass`/ACL，写入 `REDIS_PASSWORD` / `REDIS_ACL_USER` | NOAUTH/WRONGPASS 场景依赖 |
+| 密码 | 写入 `config.env` 的 **`REDIS_PASSWORD`**（gitignore，勿提交） | 脚本用 `REDISCLI_AUTH` 自动鉴权 |
 | `DEBUG SLEEP` | **未**禁用 | 慢命令场景 F14 |
-| 数据目录 | 确认真实路径，写入 `REDIS_DATA_DIR` | 默认 `/var/lib/redis` 常需改 |
+| 数据目录 | 默认 **`/var/lib/redis`** | `preflight` 用 `CONFIG GET dir` 校验；不一致时改 `config.env` |
 | 配置文件 | 确认 `REDIS_CONF`、`REDIS_SERVICE` | process-stop 恢复用 |
 | `stop-writes-on-bgsave-error` | 持久化/MISCONF 场景可写 CONFIG | persistence-fail / historical-misconf |
 
@@ -73,7 +73,7 @@
 | F19 CROSSSLOT | Cluster 模式；跨 hash tag 的 key |
 | F10 maxmemory | 当前 used memory < 目标 maxmemory，否则先清理 |
 | F17 cache-expire (FLUSHDB) | **仅实验室**；会清空当前 DB |
-| F29 historical-misconf | 可写 `REDIS_DATA_DIR`；会留下历史 MISCONF 计数 |
+| F29 historical-misconf | 可写 `REDIS_DATA_DIR` | 测完跑 `historical-misconf-cleanup` |
 | F09 reboot | 需 `--confirm YES`；**无自动恢复** |
 | D01 job-unreachable | 本机模式：阻断到指定 Redis 端口的本地/outbound 连接（见脚本） |
 | D02 hide-tools | 本机存在 `iostat`/`pidstat` 可隐藏 |
@@ -84,7 +84,8 @@
 
 ```bash
 cp config.env.example config.env
-# 编辑 REDIS_NODES / REDIS_DATA_DIR / REDIS_PASSWORD / NET_DEV
+# 必填：REDIS_PASSWORD
+# REDIS_DATA_DIR 默认 /var/lib/redis；preflight 会校验 CONFIG GET dir
 
 ./scripts/preflight.sh
 # 全部 PASS 后再交给注入 Bot 跑 SCENARIOS.md 中的命令

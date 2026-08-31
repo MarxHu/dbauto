@@ -20,6 +20,10 @@ REDIS_DATA_DIR="${REDIS_DATA_DIR:-/var/lib/redis}"
 STATE_DIR="${ROOT_DIR}/.state"
 INJECT_LOCK_FILE="${STATE_DIR}/inject.lock"
 
+if [[ -n "${REDIS_PASSWORD}" ]]; then
+  export REDISCLI_AUTH="${REDIS_PASSWORD}"
+fi
+
 mkdir -p "${STATE_DIR}"
 
 log() {
@@ -119,4 +123,54 @@ require_action() {
 
 resolve_node() {
   NODE="${NODE:-$(first_node)}"
+}
+
+node_state_key() {
+  echo "${1//[:.]/_}"
+}
+
+misconf_state_file() {
+  echo "${STATE_DIR}/misconf_$(node_state_key "${1}")"
+}
+
+save_misconf_state() {
+  local node="$1"
+  local field="$2"
+  local value="$3"
+  local file
+  file="$(misconf_state_file "${node}")"
+  touch "${file}"
+  printf '%s=%s\n' "${field}" "${value}" >> "${file}"
+}
+
+load_misconf_state() {
+  local node="$1"
+  local field="$2"
+  local default="${3:-}"
+  local file
+  file="$(misconf_state_file "${node}")"
+  if [[ -f "${file}" ]]; then
+    grep "^${field}=" "${file}" | tail -1 | cut -d= -f2- || printf '%s' "${default}"
+  else
+    printf '%s' "${default}"
+  fi
+}
+
+clear_misconf_state() {
+  rm -f "$(misconf_state_file "${1}")"
+}
+
+remote_redis_cli() {
+  local host="$1"
+  local port="$2"
+  if [[ -n "${REDIS_PASSWORD}" ]]; then
+    printf 'redis-cli --no-auth-warning -h %s -p %s -a %q' "${host}" "${port}" "${REDIS_PASSWORD}"
+  else
+    printf 'redis-cli --no-auth-warning -h %s -p %s' "${host}" "${port}"
+  fi
+}
+
+detect_redis_data_dir() {
+  local node="${1:-$(first_node)}"
+  redis_cmd "${node}" CONFIG GET dir 2>/dev/null | awk 'NR==2{print; exit}'
 }

@@ -45,19 +45,28 @@ else
   bad "REDIS_DATA_DIR missing: ${REDIS_DATA_DIR}"
 fi
 
+detected_dir="$(detect_redis_data_dir || true)"
+if [[ -n "${detected_dir}" ]]; then
+  if [[ "${detected_dir}" == "${REDIS_DATA_DIR}" ]]; then
+    ok "CONFIG GET dir matches REDIS_DATA_DIR (${detected_dir})"
+  else
+    warn "CONFIG GET dir=${detected_dir} differs from REDIS_DATA_DIR=${REDIS_DATA_DIR}; update config.env if needed"
+  fi
+else
+  warn "could not read CONFIG GET dir (auth or connectivity issue)"
+fi
+
+if [[ -n "${REDIS_PASSWORD}" ]]; then
+  ok "REDIS_PASSWORD configured"
+else
+  bad "REDIS_PASSWORD empty; set it in config.env (Redis requires auth)"
+fi
+
 node="$(first_node)"
-host="${node%%:*}"
-port="${node##*:}"
 if redis_cmd "${node}" DEBUG SLEEP 1 >/dev/null 2>&1; then
   ok "DEBUG SLEEP enabled on ${node}"
 else
   warn "DEBUG SLEEP unavailable on ${node} (slow-command scenario may fail)"
-fi
-
-if [[ -n "${REDIS_PASSWORD}" ]]; then
-  ok "REDIS_PASSWORD configured (NOAUTH pulse applicable)"
-else
-  warn "REDIS_PASSWORD empty (NOAUTH/WRONGPASS pulses need auth configured)"
 fi
 
 if command -v iostat >/dev/null 2>&1 || command -v pidstat >/dev/null 2>&1; then
