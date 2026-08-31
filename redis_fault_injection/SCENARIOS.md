@@ -1,20 +1,21 @@
 # Redis Cluster 故障注入场景总表
 
-> **验收范围**：仅验收**故障注入行为**（现象是否发生、持续、恢复）。  
-> **排障链路**（SOPS/清洗/K3）独立建设、独立验收，不在本文范围。  
-> **运行模式**：注入 Bot 与排障 Bot 在**同一台机器**执行脚本；默认本地运行（`TARGET_HOST` 为空）。  
-> **环境前提**：见 [`PREREQUISITES.md`](PREREQUISITES.md)，跑前执行 `./scripts/preflight.sh`。  
-> **持续时间**：持续型故障默认 **`--duration 600`（10 分钟）**，可用入参覆盖。到期自动恢复，无需 recover 命令。  
-> **互斥**：同一时刻只允许一个注入 action（`flock` 锁）；场景之间等上一场景恢复完再跑。
+> **验收范围**：仅验收**故障注入行为**（现象、post-check、持续、恢复）。  
+> **排障链路**（SOPS/清洗/K3）独立建设，不在本文范围。  
+> **运行模式**：注入 Bot **单独跑**；主机类故障 **SSH 到 VM**（`--target-host`）；Redis 类 Bot 直连集群。  
+> **环境前提**：见 [`PREREQUISITES.md`](PREREQUISITES.md)，跑前 `./scripts/preflight.sh`（三台 SSH + Redis 全 PASS）。  
+> **F28**：仅 preflight 写入 `.state/ssh_all_nodes.ok` 后可用。  
+> **持续时间**：默认 `--duration 600`，到期自动恢复。  
+> **互斥**：同一时刻只允许一个注入 action（`flock` 锁）。
 
 ## 脚本分类（6 + preflight）
 
 | 脚本 | 职责 |
 |---|---|
-| `scripts/preflight.sh` | 环境前提检查 |
-| `scripts/inject_host.sh` | 主机 CPU/内存/重启/基线 |
+| `scripts/preflight.sh` | SSH/Redis/工具检查，门控 F28 |
+| `scripts/inject_host.sh` | VM CPU/内存/重启/基线 |
 | `scripts/inject_redis.sh` | Redis 进程、配置、流量、协议错误 |
-| `scripts/inject_network.sh` | Cluster Bus、丢包、Master 分区 |
+| `scripts/inject_network.sh` | VM 上 Bus、丢包、Master 分区 |
 | `scripts/inject_disk.sh` | 持久化失败、磁盘 IO |
 | `scripts/inject_composite.sh` | 三个组合场景 |
 | `scripts/inject_degrade.sh` | 采集不可达、工具缺失 |
@@ -22,21 +23,25 @@
 ```bash
 cp config.env.example config.env
 ./scripts/preflight.sh
-./scripts/inject_host.sh --action cpu --duration 600
+./scripts/inject_host.sh --action cpu --target-host 10.10.26.144 --duration 600
 ```
+
+Bot 解析：`grep INJECT_RESULT` → `scenario=... status=pass|fail`
 
 ---
 
-## 一、主机资源 → `inject_host.sh`
+## 一、主机资源 → `inject_host.sh`（需 `--target-host`）
 
 | ID | 场景 | 命令 |
 |---|---|---|
 | F01 | 基线 | `./scripts/inject_host.sh --action baseline` |
-| F02 | CPU 持续高压 | `./scripts/inject_host.sh --action cpu --duration 600` |
-| F04 | 内存压力 | `./scripts/inject_host.sh --action memory --duration 600` |
-| F06 | CPU 尖峰 | `./scripts/inject_host.sh --action cpu-spike --duration 600` |
-| F09 | 主机重启 | `./scripts/inject_host.sh --action reboot --confirm YES` |
-| F28 | 多节点 CPU | `./scripts/inject_host.sh --action multi-cpu --duration 600` |
+| F02 | CPU 持续高压 | `./scripts/inject_host.sh --action cpu --target-host 10.10.26.144 --duration 600` |
+| F04 | 内存压力 | `./scripts/inject_host.sh --action memory --target-host 10.10.26.144 --duration 600` |
+| F06 | CPU 尖峰 | `./scripts/inject_host.sh --action cpu-spike --target-host 10.10.26.144 --duration 600` |
+| F09 | 主机重启 | `./scripts/inject_host.sh --action reboot --target-host 10.10.26.144 --confirm YES` |
+| F28 | 多节点 CPU | `./scripts/inject_host.sh --action multi-cpu --duration 600`（preflight 三门控） |
+
+Post-check：F02 CPU≥80%；F04 MemAvail≤15%。
 
 ---
 
@@ -54,20 +59,18 @@ cp config.env.example config.env
 | F18 | 缓存穿透 | `./scripts/inject_redis.sh --action cache-penetrate --node ... --duration 600` |
 | F19 | 协议脉冲 | `./scripts/inject_redis.sh --action error-pulse --node ... --error-type NOAUTH` |
 | F29 | 历史 MISCONF | `./scripts/inject_redis.sh --action historical-misconf --node 10.10.26.146:6381` |
-| F29c | 清理 MISCONF 背景 | `./scripts/inject_redis.sh --action historical-misconf-cleanup --node 10.10.26.146:6381` |
+| F29c | 清理 MISCONF | `./scripts/inject_redis.sh --action historical-misconf-cleanup --node 10.10.26.146:6381` |
 
-**F19 说明**：有界脉冲固定 `5s × 18 = 90s`；脚本会打印 pulse 前后 `INFO ERRORSTATS`。
-
-**F29 清理**：MISCONF 累计计数需 **重启 Redis** 才能清零。单独 F29 后跑 `historical-misconf-cleanup`；C01 组合在内存 600s 结束后 **自动 cleanup**；跑 F01 基线前务必已清理。
+Post-check：F07 PING down；F19/F29 ERRORSTATS 递增。
 
 ---
 
-## 三、网络 → `inject_network.sh`
+## 三、网络 → `inject_network.sh`（VM 上 iptables/tc）
 
 | ID | 场景 | 命令 |
 |---|---|---|
 | F20 | Bus 阻断 | `./scripts/inject_network.sh --action bus-block --node 10.10.26.144:6381 --duration 600` |
-| F22 | 丢包 | `./scripts/inject_network.sh --action packet-loss --duration 600 --loss 30 --net-dev eth0` |
+| F22 | 丢包 | `./scripts/inject_network.sh --action packet-loss --target-host 10.10.26.144 --duration 600 --loss 30 --net-dev eth0` |
 | F30 | Master 分区 | `./scripts/inject_network.sh --action master-partition --node-a 10.10.26.144 --node-b 10.10.26.145 --duration 600` |
 
 ---
@@ -77,7 +80,7 @@ cp config.env.example config.env
 | ID | 场景 | 命令 |
 |---|---|---|
 | F24 | 持久化失败 | `./scripts/inject_disk.sh --action persistence-fail --node 10.10.26.146:6381 --duration 600` |
-| F26 | 磁盘 IO | `./scripts/inject_disk.sh --action io-stress --duration 600` |
+| F26 | 磁盘 IO | `./scripts/inject_disk.sh --action io-stress --target-host 10.10.26.144 --duration 600` |
 
 ---
 
@@ -91,7 +94,7 @@ cp config.env.example config.env
 
 ---
 
-## 六、降级 → `inject_degrade.sh`
+## 六、降级 → `inject_degrade.sh`（Bot 本机）
 
 | ID | 场景 | 命令 |
 |---|---|---|
@@ -104,17 +107,18 @@ cp config.env.example config.env
 
 ```text
 注入 Bot:
-  1. preflight.sh
-  2. inject_*.sh --action ... --duration 600
-  3. 等待脚本退出（= 故障已自动恢复）
+  1. preflight.sh（FAIL=0）
+  2. inject_*.sh --duration 600 [--target-host VM]
+  3. 检查 INJECT_RESULT status=pass
+  4. 等待脚本退出（= 故障已自动恢复）
 
 排障 Bot（独立）:
-  在注入持续期间或之后任意时刻触发外部 SOPS（与本目录无关）
+  在注入持续期间触发外部 SOPS
 
 注意:
-  - 不要并行跑两个 inject action（锁会拒绝）
-  - C01 先 historical-misconf（瞬时）再 memory（600s）
-  - F29 跑完后若要做基线，需先清理 MISCONF 背景或换节点
+  - 不要并行跑两个 inject action
+  - F28 需 preflight 三门控 SSH
+  - F29 跑完后 cleanup 再做基线
 ```
 
 ---
@@ -123,8 +127,8 @@ cp config.env.example config.env
 
 ```text
 --action <name>          必填
---duration <seconds>     默认 600（10 分钟），入参可改
+--duration <seconds>     默认 600
 --node <ip:port>
---target-host <ip>       可选；单机模式留空
+--target-host <VM IP>    主机/VM 网络/磁盘 IO 必填
 --error-type             NOAUTH|WRONGPASS|MOVED|CROSSSLOT
 ```

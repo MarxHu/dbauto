@@ -137,88 +137,91 @@ case "${ACTION}" in
     parse_duration
     STOPPED_NODE="${NODE}"
     TARGET_HOST="${TARGET_HOST:-${host}}"
-    log "stop redis on ${NODE} for ${DURATION}s"
-    run_on_target "
-      redis-cli -h ${host} -p ${port} SHUTDOWN NOSAVE 2>/dev/null || \
-      systemctl stop redis 2>/dev/null || \
-      pkill -f 'redis-server.*:${port}' || true
-    "
+    RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
+    log "stop redis on ${NODE} for ${DURATION}s via SSH ${TARGET_HOST}"
+    run_on_target "${RCLI} SHUTDOWN NOSAVE 2>/dev/null || systemctl stop ${REDIS_SERVICE:-redis} 2>/dev/null || pkill -f 'redis-server.*:${port}' || true"
+    sleep 2
+    post_check_ping_down "${NODE}" || { emit_inject_result "process-stop" "fail" "still pingable"; exit 1; }
+    emit_inject_result "process-stop" "pass" "redis down on ${NODE}"
     run_timed_fault "${DURATION}" recover_process_stop
     ;;
   maxmemory)
     parse_duration
     ORIG_MAXMEMORY="$(redis_cmd "${NODE}" CONFIG GET maxmemory | awk 'NR==2{print}')"
     redis_cmd "${NODE}" CONFIG SET maxmemory "${MAXMEMORY}" >/dev/null
+    current="$(redis_cmd "${NODE}" CONFIG GET maxmemory | awk 'NR==2{print}')"
+    [[ "${current}" == "${MAXMEMORY}" ]] || die "maxmemory not applied on ${NODE}"
     log "maxmemory=${MAXMEMORY} on ${NODE}, original=${ORIG_MAXMEMORY}"
-    run_on_target "
-      end=\$((SECONDS+${DURATION}))
+    (
+      end=$((SECONDS + DURATION))
       i=0
       while (( SECONDS < end )); do
-        redis-cli -h ${host} -p ${port} SET fault:fill:\$i \$(head -c 4096 /dev/zero | tr '\0' 'x') >/dev/null 2>&1 || break
-        i=\$((i+1))
+        redis_cmd "${NODE}" SET "fault:fill:${i}" "$(head -c 4096 /dev/zero | tr '\0' 'x')" >/dev/null 2>&1 || break
+        i=$((i + 1))
         sleep 0.2
       done
-    " &
+    ) &
     FILL_PID=$!
+    emit_inject_result "maxmemory" "pass" "maxmemory=${MAXMEMORY} on ${NODE}"
     run_timed_fault "${DURATION}" recover_maxmemory
     ;;
   maxclients)
     parse_duration
     ORIG_MAXCLIENTS="$(redis_cmd "${NODE}" CONFIG GET maxclients | awk 'NR==2{print}')"
     redis_cmd "${NODE}" CONFIG SET maxclients "${MAXCLIENTS}" >/dev/null
-    run_on_target "
-      end=\$((SECONDS+${DURATION}))
+    current="$(redis_cmd "${NODE}" CONFIG GET maxclients | awk 'NR==2{print}')"
+    [[ "${current}" == "${MAXCLIENTS}" ]] || die "maxclients not applied on ${NODE}"
+    (
+      end=$((SECONDS + DURATION))
       while (( SECONDS < end )); do
-        for _ in \$(seq 1 20); do
-          redis-cli -h ${host} -p ${port} PING >/dev/null 2>&1 &
+        for _ in $(seq 1 20); do
+          redis_cmd "${NODE}" PING >/dev/null 2>&1 &
         done
         sleep 1
       done
-      pkill -f 'redis-cli -h ${host} -p ${port} PING' 2>/dev/null || true
-    " &
+      wait 2>/dev/null || true
+    ) &
     FILL_PID=$!
+    emit_inject_result "maxclients" "pass" "maxclients=${MAXCLIENTS} on ${NODE}"
     run_timed_fault "${DURATION}" recover_maxclients
     ;;
   slow-command)
     parse_duration
-    run_on_target "
-      end=\$((SECONDS+${DURATION}))
+    redis_cmd "${NODE}" DEBUG SLEEP 1 >/dev/null 2>&1 || die "DEBUG SLEEP not available on ${NODE}"
+    (
+      end=$((SECONDS + DURATION))
       while (( SECONDS < end )); do
-        redis-cli -h ${host} -p ${port} DEBUG SLEEP ${SLEEP_MS} >/dev/null 2>&1 || true
-        sleep ${INTERVAL}
+        redis_cmd "${NODE}" DEBUG SLEEP "${SLEEP_MS}" >/dev/null 2>&1 || true
+        sleep "${INTERVAL}"
       done
-    " &
+    ) &
     FILL_PID=$!
+    emit_inject_result "slow-command" "pass" "debug sleep on ${NODE}"
     run_timed_fault "${DURATION}" recover_slow_command
     ;;
   hot-key)
     parse_duration
-    run_on_target "
-      end=\$((SECONDS+${DURATION}))
-      for t in \$(seq 1 ${THREADS}); do
-        (
-          i=0
-          while (( SECONDS < end )); do
-            redis-cli -h ${host} -p ${port} SET ${KEY}:\$i hot >/dev/null 2>&1
-            redis-cli -h ${host} -p ${port} GET ${KEY}:\$i >/dev/null 2>&1
-            i=\$((i+1))
-          done
-        ) &
+    (
+      end=$((SECONDS + DURATION))
+      i=0
+      while (( SECONDS < end )); do
+        redis_cmd "${NODE}" SET "${KEY}:${i}" hot >/dev/null 2>&1
+        redis_cmd "${NODE}" GET "${KEY}:${i}" >/dev/null 2>&1
+        i=$((i + 1))
       done
-      wait
-    " &
+    ) &
     FILL_PID=$!
+    emit_inject_result "hot-key" "pass" "hot key traffic on ${NODE}"
     run_timed_fault "${DURATION}" recover_hot_key
     ;;
   big-key)
     parse_duration
     BIGKEY_NAME="${KEY}"
-    run_on_target "
-      redis-cli -h ${host} -p ${port} DEL ${BIGKEY_NAME} >/dev/null 2>&1 || true
-      for i in \$(seq 1 ${FIELD_COUNT}); do
-        redis-cli -h ${host} -p ${port} HSET ${BIGKEY_NAME} field_\$i \$(head -c ${VALUE_SIZE} /dev/zero | tr '\0' 'b') >/dev/null
-      done
-    "
+    redis_cmd "${NODE}" DEL "${BIGKEY_NAME}" >/dev/null 2>&1 || true
+    for i in $(seq 1 "${FIELD_COUNT}"); do
+      redis_cmd "${NODE}" HSET "${BIGKEY_NAME}" "field_${i}" "$(head -c "${VALUE_SIZE}" /dev/zero | tr '\0' 'b')" >/dev/null
+    done
+    emit_inject_result "big-key" "pass" "seeded ${BIGKEY_NAME} on ${NODE}"
     run_timed_fault "${DURATION}" recover_big_key
     ;;
   cache-expire)
@@ -239,22 +242,25 @@ case "${ACTION}" in
     ;;
   cache-penetrate)
     parse_duration
-    run_on_target "
-      end=\$((SECONDS+${DURATION}))
+    (
+      end=$((SECONDS + DURATION))
       sent=0
-      while (( SECONDS < end )) && (( sent < ${REQUEST_COUNT} )); do
-        redis-cli -h ${host} -p ${port} GET fault:missing:\$RANDOM >/dev/null 2>&1 || true
-        sent=\$((sent+1))
+      while (( SECONDS < end )) && (( sent < REQUEST_COUNT )); do
+        redis_cmd "${NODE}" GET "fault:missing:${RANDOM}" >/dev/null 2>&1 || true
+        sent=$((sent + 1))
       done
-    " &
+    ) &
     FILL_PID=$!
+    emit_inject_result "cache-penetrate" "pass" "started on ${NODE}"
     run_timed_fault "${DURATION}" recover_cache_penetrate
     ;;
   error-pulse)
     parse_duration
     log "error pulse ${ERROR_TYPE} on ${NODE}; bounded ${PULSE_INTERVAL}s x ${PULSE_MAX}"
-    baseline="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep -E 'NOAUTH|WRONGPASS|MISCONF|MOVED|CROSSSLOT' || true)"
-    [[ -n "${baseline}" ]] && log "baseline errorstats: ${baseline}"
+    stat_key="${ERROR_TYPE}"
+    [[ "${ERROR_TYPE}" == "WRONGPASS" ]] && stat_key="WRONGPASS"
+    before="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep -i "${stat_key}" | awk -F: '{gsub(/\r/,"",$2); print $2}' | head -1 || echo 0)"
+    before="${before:-0}"
     end_time=$((SECONDS + DURATION))
     count=0
     while (( SECONDS < end_time )) && (( count < PULSE_MAX )); do
@@ -276,56 +282,61 @@ case "${ACTION}" in
       count=$((count + 1))
       sleep "${PULSE_INTERVAL}"
     done
-    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep -E 'NOAUTH|WRONGPASS|MISCONF|MOVED|CROSSSLOT' || true)"
-    log "sent ${count} ${ERROR_TYPE} pulses"
-    [[ -n "${after}" ]] && log "after errorstats: ${after}"
+    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep -i "${stat_key}" | awk -F: '{gsub(/\r/,"",$2); print $2}' | head -1 || echo 0)"
+    after="${after:-0}"
+    log "pulse count=${count} ${ERROR_TYPE} errorstats before=${before} after=${after}"
+    if (( after > before )); then
+      emit_inject_result "error-pulse" "pass" "${ERROR_TYPE} ${before}->${after}"
+    else
+      emit_inject_result "error-pulse" "fail" "${ERROR_TYPE} no increment"
+      exit 1
+    fi
     ;;
   historical-misconf)
-    log "seed historical MISCONF on ${NODE}"
-    before="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF || echo 'MISCONF:0')"
-    log "before: ${before}"
+    TARGET_HOST="${TARGET_HOST:-${host}}"
+    RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
+    before="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF | awk -F: '{gsub(/\r/,"",$2); print $2}' || echo 0)"
+    before="${before:-0}"
     orig_stop="$(redis_cmd "${NODE}" CONFIG GET stop-writes-on-bgsave-error | awk 'NR==2{print}')"
     orig_stop="${orig_stop:-yes}"
     save_misconf_state "${NODE}" stop_writes "${orig_stop}"
     redis_cmd "${NODE}" CONFIG SET stop-writes-on-bgsave-error yes >/dev/null 2>&1 || \
       die "cannot set stop-writes-on-bgsave-error on ${NODE}"
     run_on_target "chmod -R a-w ${REDIS_DATA_DIR}"
-    redis_cmd "${NODE}" SET "fault:historical:misconf:$(date +%s)" seed >/dev/null 2>&1 || true
+    run_on_target "${RCLI} SET fault:historical:misconf:$(date +%s) seed >/dev/null 2>&1 || true"
     run_on_target "chmod -R u+w ${REDIS_DATA_DIR}"
-    redis_cmd "${NODE}" BGSAVE >/dev/null 2>&1 || true
-    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF || echo '')"
-    persist="$(redis_cmd "${NODE}" INFO PERSISTENCE 2>/dev/null | grep -E 'rdb_last_bgsave_status|aof_last_write_status' || true)"
-    log "after: ${after}"
-    log "persistence: ${persist}"
-    log "run historical-misconf-cleanup after test to avoid polluting later scenarios"
+    run_on_target "${RCLI} BGSAVE >/dev/null 2>&1 || true"
+    sleep 2
+    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF | awk -F: '{gsub(/\r/,"",$2); print $2}' || echo 0)"
+    after="${after:-0}"
+    log "MISCONF before=${before} after=${after}"
+    if (( after > before )); then
+      emit_inject_result "historical-misconf" "pass" "MISCONF ${before}->${after}"
+    else
+      emit_inject_result "historical-misconf" "fail" "MISCONF not incremented"
+      exit 1
+    fi
+    log "run historical-misconf-cleanup after test"
     ;;
   historical-misconf-cleanup)
     MISCONF_CLEANUP_RESTART="${MISCONF_CLEANUP_RESTART:-YES}"
+    TARGET_HOST="${TARGET_HOST:-${host}}"
+    RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
     orig_stop="$(load_misconf_state "${NODE}" stop_writes "yes")"
-    log "restore stop-writes-on-bgsave-error=${orig_stop} on ${NODE}"
     redis_cmd "${NODE}" CONFIG SET stop-writes-on-bgsave-error "${orig_stop}" >/dev/null 2>&1 || true
     if [[ "${MISCONF_CLEANUP_RESTART}" == "YES" ]]; then
-      log "restarting redis on ${NODE} to reset ERRORSTATS counters"
-      TARGET_HOST="${TARGET_HOST:-${host}}"
-      run_on_target "
-        redis-cli -h ${host} -p ${port} SHUTDOWN NOSAVE 2>/dev/null || \
-        systemctl stop ${REDIS_SERVICE:-redis} 2>/dev/null || true
-        sleep 2
-        systemctl start ${REDIS_SERVICE:-redis} 2>/dev/null || \
-        redis-server ${REDIS_CONF:-/etc/redis/redis.conf} 2>/dev/null || true
-      "
+      run_on_target "${RCLI} SHUTDOWN NOSAVE 2>/dev/null || systemctl stop ${REDIS_SERVICE:-redis} 2>/dev/null || true"
+      sleep 2
+      run_on_target "systemctl start ${REDIS_SERVICE:-redis} 2>/dev/null || redis-server ${REDIS_CONF:-/etc/redis/redis.conf} 2>/dev/null || true"
       for _ in $(seq 1 30); do
-        if redis_cmd "${NODE}" PING >/dev/null 2>&1; then
-          break
-        fi
+        redis_cmd "${NODE}" PING >/dev/null 2>&1 && break
         sleep 1
       done
-      redis_cmd "${NODE}" PING >/dev/null || die "redis did not come back on ${NODE}"
+      post_check_ping_up "${NODE}" || { emit_inject_result "historical-misconf-cleanup" "fail" "redis not up"; exit 1; }
     fi
-    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF || echo 'MISCONF:0')"
-    log "after cleanup: ${after}"
+    after="$(redis_cmd "${NODE}" INFO ERRORSTATS 2>/dev/null | grep MISCONF | awk -F: '{gsub(/\r/,"",$2); print $2}' | head -1 || echo 0)"
     clear_misconf_state "${NODE}"
-    log "historical MISCONF background cleared"
+    emit_inject_result "historical-misconf-cleanup" "pass" "MISCONF=${after}"
     ;;
   *)
     usage

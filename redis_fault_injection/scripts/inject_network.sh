@@ -18,9 +18,9 @@ usage() {
   cat <<EOF
 
 Actions:
-  bus-block            Block cluster bus port on target host
-  packet-loss          Inject netem packet loss on target host NIC
-  master-partition     Bidirectional partition between two master hosts
+  bus-block            Block cluster bus port on target VM (SSH iptables)
+  packet-loss          Inject netem packet loss on target VM NIC (requires --target-host)
+  master-partition     Bidirectional partition between two master VMs (requires SSH to both)
 
 Extra options:
   --node-a <ip>        first host for master-partition
@@ -30,7 +30,7 @@ Extra options:
 
 Examples:
   $0 --action bus-block --node 10.10.26.144:6381 --duration 240
-  $0 --action packet-loss --target-host 10.10.26.144 --duration 120 --loss 30
+  $0 --action packet-loss --target-host 10.10.26.144 --duration 120 --loss 30 --net-dev eth0
   $0 --action master-partition --node-a 10.10.26.144 --node-b 10.10.26.145 --duration 240
 EOF
 }
@@ -83,25 +83,29 @@ case "${ACTION}" in
     resolve_node
     TARGET_HOST="${TARGET_HOST:-${NODE%%:*}}"
     BUS_PORT="${CLUSTER_BUS_PORT:-$(( ${NODE##*:} + 10000 ))}"
-    log "block cluster bus tcp/${BUS_PORT} on ${TARGET_HOST}"
+    log "block cluster bus tcp/${BUS_PORT} on ${TARGET_HOST} via SSH"
     run_on_target "
       iptables -C INPUT -p tcp --dport ${BUS_PORT} -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport ${BUS_PORT} -j DROP
       iptables -C OUTPUT -p tcp --dport ${BUS_PORT} -j DROP 2>/dev/null || iptables -A OUTPUT -p tcp --dport ${BUS_PORT} -j DROP
     "
+    emit_inject_result "bus-block" "pass" "bus blocked on ${TARGET_HOST}:${BUS_PORT}"
     run_timed_fault "${DURATION}" recover_bus_block
     ;;
   packet-loss)
     parse_duration
-    require_cmd tc
-    log "inject ${LOSS}% packet loss on ${NET_DEV} for ${DURATION}s"
+    require_target_host
+    run_on_target "command -v tc >/dev/null" || die "tc not installed on ${TARGET_HOST}"
+    log "inject ${LOSS}% packet loss on ${NET_DEV}@${TARGET_HOST} for ${DURATION}s"
     run_on_target "
       tc qdisc add dev ${NET_DEV} root handle 1: htb 2>/dev/null || true
       tc qdisc add dev ${NET_DEV} parent 1:1 handle 10: netem loss ${LOSS}%
     "
+    emit_inject_result "packet-loss" "pass" "loss=${LOSS}% on ${TARGET_HOST}:${NET_DEV}"
     run_timed_fault "${DURATION}" recover_packet_loss
     ;;
   master-partition)
     parse_duration
+    require_ssh_hosts "${NODE_A}" "${NODE_B}"
     log "partition ${NODE_A} <-> ${NODE_B} for ${DURATION}s"
     for host in "${NODE_A}" "${NODE_B}"; do
       peer="$([[ "${host}" == "${NODE_A}" ]] && echo "${NODE_B}" || echo "${NODE_A}")"
@@ -110,6 +114,7 @@ case "${ACTION}" in
         iptables -C OUTPUT -d ${peer} -j DROP 2>/dev/null || iptables -A OUTPUT -d ${peer} -j DROP
       "
     done
+    emit_inject_result "master-partition" "pass" "${NODE_A}<->${NODE_B}"
     run_timed_fault "${DURATION}" recover_master_partition
     ;;
   *)

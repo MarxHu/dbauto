@@ -174,3 +174,90 @@ detect_redis_data_dir() {
   local node="${1:-$(first_node)}"
   redis_cmd "${node}" CONFIG GET dir 2>/dev/null | awk 'NR==2{print; exit}'
 }
+
+ssh_check() {
+  local host="$1"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${host}" "echo ok" >/dev/null 2>&1
+}
+
+require_target_host() {
+  [[ -n "${TARGET_HOST}" ]] || die "host-level fault requires --target-host <VM IP> (injection bot runs outside Docker/VM nodes)"
+}
+
+require_ssh_all_nodes() {
+  [[ -f "${STATE_DIR}/ssh_all_nodes.ok" ]] || die "requires all VM nodes SSH reachable; run preflight.sh first"
+}
+
+require_ssh_hosts() {
+  local host
+  for host in "$@"; do
+    ssh_check "${host}" || die "SSH unreachable ${SSH_USER}@${host} (run preflight.sh)"
+  done
+}
+
+remote_cmd_check() {
+  local host="$1"
+  local cmd="$2"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${host}" "command -v ${cmd}" >/dev/null 2>&1
+}
+
+post_check_cpu() {
+  local min_used="${1:-80}"
+  sleep 5
+  local avg
+  avg="$(run_on_target "vmstat 1 3 | awk 'NR>2 {idle=\$15; if(idle!=\"\") {sum+=100-idle; n++}} END {if(n>0) printf \"%.0f\", sum/n; else print \"0\"}'")"
+  if [[ -z "${avg}" ]] || ! [[ "${avg}" =~ ^[0-9]+$ ]]; then
+    log "POSTCHECK FAIL: could not parse CPU from vmstat on ${TARGET_HOST:-localhost}"
+    return 1
+  fi
+  if (( avg >= min_used )); then
+    log "POSTCHECK PASS: host_cpu_used_pct_avg=${avg} (>=${min_used})"
+    return 0
+  fi
+  log "POSTCHECK FAIL: host_cpu_used_pct_avg=${avg} (<${min_used})"
+  return 1
+}
+
+post_check_memory() {
+  local max_avail="${1:-15}"
+  sleep 5
+  local avail_pct
+  avail_pct="$(run_on_target "awk '/MemTotal:/{t=\$2} /MemAvailable:/{a=\$2} END{if(t>0) print int(a*100/t); else print 100}' /proc/meminfo")"
+  if [[ -z "${avail_pct}" ]] || ! [[ "${avail_pct}" =~ ^[0-9]+$ ]]; then
+    log "POSTCHECK FAIL: could not parse memory from /proc/meminfo on ${TARGET_HOST:-localhost}"
+    return 1
+  fi
+  if (( avail_pct <= max_avail )); then
+    log "POSTCHECK PASS: memory_available_pct=${avail_pct} (<=${max_avail})"
+    return 0
+  fi
+  log "POSTCHECK FAIL: memory_available_pct=${avail_pct} (>${max_avail})"
+  return 1
+}
+
+post_check_ping_down() {
+  local node="$1"
+  if ! redis_cmd "${node}" PING >/dev/null 2>&1; then
+    log "POSTCHECK PASS: redis unreachable on ${node}"
+    return 0
+  fi
+  log "POSTCHECK FAIL: redis still responds to PING on ${node}"
+  return 1
+}
+
+post_check_ping_up() {
+  local node="$1"
+  if redis_cmd "${node}" PING >/dev/null 2>&1; then
+    log "POSTCHECK PASS: redis PING ok on ${node}"
+    return 0
+  fi
+  log "POSTCHECK FAIL: redis PING failed on ${node}"
+  return 1
+}
+
+emit_inject_result() {
+  local scenario="$1"
+  local status="$2"
+  local detail="${3:-}"
+  log "INJECT_RESULT scenario=${scenario} status=${status} detail=${detail}"
+}

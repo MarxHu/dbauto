@@ -15,20 +15,16 @@ usage() {
   cat <<EOF
 
 Actions:
-  persistence-fail     Make redis data dir read-only and trigger BGSAVE
-  io-stress            Sustained disk write load
-
-Extra options:
-  --data-dir <path>    redis data directory (default ${REDIS_DATA_DIR})
+  persistence-fail     Make redis data dir read-only on VM and trigger BGSAVE
+  io-stress            Sustained disk write load on --target-host VM
 
 Examples:
-  $0 --action persistence-fail --node 10.10.26.146:6381 --duration 240
-  $0 --action io-stress --target-host 10.10.26.144 --duration 240
+  $0 --action persistence-fail --node 10.10.26.146:6381 --duration 600
+  $0 --action io-stress --target-host 10.10.26.144 --duration 600
 EOF
 }
 
 recover_persistence_fail() {
-  resolve_node
   run_on_target "chmod -R u+w ${REDIS_DATA_DIR} 2>/dev/null || chmod -R 755 ${REDIS_DATA_DIR}"
   log "restored write permission on ${REDIS_DATA_DIR}"
 }
@@ -51,7 +47,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_action
-
 acquire_inject_lock
 
 case "${ACTION}" in
@@ -60,16 +55,18 @@ case "${ACTION}" in
     resolve_node
     host="${NODE%%:*}"
     port="${NODE##*:}"
-    log "persistence failure on ${NODE} for ${DURATION}s"
-    run_on_target "
-      chmod -R a-w ${REDIS_DATA_DIR}
-      redis-cli -h ${host} -p ${port} CONFIG SET stop-writes-on-bgsave-error yes >/dev/null 2>&1 || true
-      redis-cli -h ${host} -p ${port} BGSAVE >/dev/null 2>&1 || true
-    "
+    TARGET_HOST="${TARGET_HOST:-${host}}"
+    RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
+    log "persistence failure on ${NODE} via SSH ${TARGET_HOST}"
+    run_on_target "chmod -R a-w ${REDIS_DATA_DIR}"
+    run_on_target "${RCLI} CONFIG SET stop-writes-on-bgsave-error yes >/dev/null 2>&1 || true"
+    run_on_target "${RCLI} BGSAVE >/dev/null 2>&1 || true"
+    emit_inject_result "persistence-fail" "pass" "data dir ro on ${TARGET_HOST}"
     run_timed_fault "${DURATION}" recover_persistence_fail
     ;;
   io-stress)
     parse_duration
+    require_target_host
     run_on_target "
       mkdir -p ${IO_DIR}
       end=\$((SECONDS+${DURATION}))
@@ -78,6 +75,7 @@ case "${ACTION}" in
       done
     " &
     IO_PID=$!
+    emit_inject_result "io-stress" "pass" "disk io on ${TARGET_HOST}"
     run_timed_fault "${DURATION}" recover_io_stress
     ;;
   *)
