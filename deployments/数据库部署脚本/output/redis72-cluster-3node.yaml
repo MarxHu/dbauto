@@ -322,29 +322,34 @@ spec:
             echo "${tarball_sha256}  ${tarball}" | sha256sum -c -
 
             # 干净树重编：镜像 bake 编过并卸载，不等于部署时可跳过编译。
-            # 禁止裸 make -j（易出现 release.h 未生成 / bundled jemalloc 未就绪）。
+            # 解决 release.h 缺失 / bundled jemalloc 未就绪：先 deps → 显式 mkreleasehdr → 再编主程序。
             rm -rf "redis-${redis_version}"
             tar -xzf "$tarball"
             cd "redis-${redis_version}"
-            chmod +x src/mkreleasehdr.sh deps/jemalloc/configure 2>/dev/null || true
+            # 编译阶段恢复默认 umask，避免 configure/生成头文件权限异常
+            umask 022
+            chmod +x src/mkreleasehdr.sh 2>/dev/null || true
+            [[ -f deps/jemalloc/configure ]] && chmod +x deps/jemalloc/configure || true
 
             info "先编译 deps（jemalloc/hiredis/linenoise/lua）"
+            make -C deps distclean >/dev/null 2>&1 || true
             make -C deps jemalloc hiredis linenoise lua
+            [[ -f deps/jemalloc/include/jemalloc/jemalloc.h ]] \
+              || error "bundled jemalloc 未生成 include/jemalloc/jemalloc.h"
 
-            info "生成 release.h 后再编主程序"
+            info "生成 release.h"
             ( cd src && sh ./mkreleasehdr.sh )
-            [[ -f src/release.h ]] || error "mkreleasehdr.sh 未生成 src/release.h"
+            [[ -s src/release.h ]] || error "mkreleasehdr.sh 未生成 src/release.h"
+            info "release.h 已生成: $(wc -c < src/release.h) bytes"
 
-            if ! make -j"${parallel}" BUILD_TLS=no; then
-              info "并行编译失败，降级 make -j1 重试"
-              make distclean || true
-              make -C deps jemalloc hiredis linenoise lua
-              ( cd src && sh ./mkreleasehdr.sh )
-              make -j1 BUILD_TLS=no
-            fi
+            # 交付默认用 -j1，避免并行竞态再次踩 release.h；可用环境 PARALLEL 覆盖
+            build_jobs="${REDIS_MAKE_JOBS:-1}"
+            info "编译 redis-server（-j${build_jobs}）"
+            make -j"${build_jobs}" BUILD_TLS=no
 
             make PREFIX="${install_prefix}" install
             [[ -x "${install_prefix}/bin/redis-server" ]] || error "install 后缺少 redis-server"
+            [[ -x "${install_prefix}/bin/redis-cli" ]] || error "install 后缺少 redis-cli"
             "${install_prefix}/bin/redis-server" --version
             info "二进制安装完成: ${install_prefix}"
         job_ip_list:
@@ -822,22 +827,22 @@ spec:
   constants:
     "${redis_node1_ip}":
       name: Redis节点1 IP
-      value: 172.30.0.11
+      value: 10.10.26.144
       type: input
       validation: "^[0-9.]+$"
     "${redis_node2_ip}":
       name: Redis节点2 IP
-      value: 172.30.0.12
+      value: 10.10.26.145
       type: input
       validation: "^[0-9.]+$"
     "${redis_node3_ip}":
       name: Redis节点3 IP
-      value: 172.30.0.13
+      value: 10.10.26.146
       type: input
       validation: "^[0-9.]+$"
     "${redis_node_ips}":
       name: Redis三节点IP列表
-      value: 172.30.0.11,172.30.0.12,172.30.0.13
+      value: 10.10.26.144,10.10.26.145,10.10.26.146
       type: input
       validation: "^[0-9.,]+$"
     "${redis_password}":
