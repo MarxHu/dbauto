@@ -96,13 +96,13 @@ case "${ACTION}" in
   packet-loss)
     parse_duration
     require_target
-    run_on_target "command -v tc >/dev/null" || die "tc not installed in $(target_label)"
-    log "inject ${LOSS}% packet loss on ${NET_DEV}@$(target_label) for ${DURATION}s"
-    run_on_target "
-      tc qdisc add dev ${NET_DEV} root handle 1: htb 2>/dev/null || true
-      tc qdisc add dev ${NET_DEV} parent 1:1 handle 10: netem loss ${LOSS}%
-    "
-    emit_inject_result "packet-loss" "pass" "loss=${LOSS}% on $(target_label):${NET_DEV}"
+    inject_begin packet-loss recover_packet_loss
+    run_on_target "command -v tc >/dev/null" || inject_fail "tc missing in $(target_label)"
+    log "inject ${LOSS}% packet loss on ${NET_DEV}@$(target_label) for ${DURATION}s (root netem)"
+    apply_netem_loss "${NET_DEV}" "${LOSS}" \
+      || inject_fail "tc netem replace failed on ${NET_DEV} (load sch_netem on host)"
+    post_check_packet_loss "${NET_DEV}" "${LOSS}" || inject_fail "netem not active"
+    inject_pass "loss=${LOSS}% on $(target_label):${NET_DEV}"
     run_timed_fault "${DURATION}" recover_packet_loss
     ;;
   master-partition)

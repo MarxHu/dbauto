@@ -391,15 +391,20 @@ post_check_cpu() {
 
 post_check_memory() {
   local max_avail="${1:-15}"
+  local min_used="${2:-85}"
   sleep 5
-  local avail_pct
-  # Prefer cgroup limit when present (docker memory limit); else /proc/meminfo
-  avail_pct="$(run_on_target '
+  local metrics avail used source
+  metrics="$(run_on_target '
+    read_meminfo_avail() {
+      awk "/MemTotal:/{t=\$2} /MemAvailable:/{a=\$2} END{if(t>0) print int(a*100/t); else print 100}" /proc/meminfo
+    }
     if [[ -f /sys/fs/cgroup/memory.max ]]; then
       max=$(cat /sys/fs/cgroup/memory.max)
       cur=$(cat /sys/fs/cgroup/memory.current)
       if [[ "$max" != "max" && "$max" -gt 0 ]]; then
-        echo $(( (max - cur) * 100 / max ))
+        avail=$(( (max - cur) * 100 / max ))
+        used=$(( cur * 100 / max ))
+        echo "source=cgroup avail=${avail} used=${used}"
         exit 0
       fi
     fi
@@ -407,21 +412,83 @@ post_check_memory() {
       max=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
       cur=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes)
       if [[ "$max" -lt 9000000000000000000 && "$max" -gt 0 ]]; then
-        echo $(( (max - cur) * 100 / max ))
+        avail=$(( (max - cur) * 100 / max ))
+        used=$(( cur * 100 / max ))
+        echo "source=cgroup avail=${avail} used=${used}"
         exit 0
       fi
     fi
-    awk "/MemTotal:/{t=\$2} /MemAvailable:/{a=\$2} END{if(t>0) print int(a*100/t); else print 100}" /proc/meminfo
+    avail=$(read_meminfo_avail)
+    used=$((100 - avail))
+    echo "source=meminfo avail=${avail} used=${used}"
   ')"
-  if [[ -z "${avail_pct}" ]] || ! [[ "${avail_pct}" =~ ^[0-9]+$ ]]; then
-    log "POSTCHECK FAIL: could not parse memory on $(target_label)"
+  source="$(printf '%s' "${metrics}" | sed -n 's/.*source=\([^ ]*\).*/\1/p')"
+  avail="$(printf '%s' "${metrics}" | sed -n 's/.*avail=\([0-9]*\).*/\1/p')"
+  used="$(printf '%s' "${metrics}" | sed -n 's/.*used=\([0-9]*\).*/\1/p')"
+  if [[ -z "${avail}" ]] || ! [[ "${avail}" =~ ^[0-9]+$ ]]; then
+    log "POSTCHECK FAIL: could not parse memory on $(target_label) metrics=${metrics}"
     return 1
   fi
-  if (( avail_pct <= max_avail )); then
-    log "POSTCHECK PASS: memory_available_pct=${avail_pct} (<=${max_avail})"
+  used="${used:-$((100 - avail))}"
+  log "POSTCHECK memory ${source} avail=${avail}% used=${used}% on $(target_label)"
+  if [[ "${source}" == "meminfo" ]]; then
+    log "POSTCHECK WARN: no cgroup memory limit; set container mem_limit for reliable F04"
+  fi
+  if (( avail <= max_avail )) || (( used >= min_used )); then
+    log "POSTCHECK PASS: memory_available_pct=${avail} (<=${max_avail}) or used_pct=${used} (>=${min_used})"
     return 0
   fi
-  log "POSTCHECK FAIL: memory_available_pct=${avail_pct} (>${max_avail})"
+  log "POSTCHECK FAIL: memory_available_pct=${avail} (>${max_avail}) and used_pct=${used} (<${min_used})"
+  return 1
+}
+
+post_check_packet_loss() {
+  local dev="${1:-eth0}"
+  local loss="${2:-30}"
+  sleep 1
+  local show
+  show="$(run_on_target "tc qdisc show dev ${dev} 2>/dev/null || true")"
+  if printf '%s' "${show}" | grep -qE 'netem.*loss'; then
+    log "POSTCHECK PASS: netem loss active on ${dev}: ${show}"
+    return 0
+  fi
+  log "POSTCHECK FAIL: no netem loss qdisc on ${dev}; got: ${show}"
+  return 1
+}
+
+post_check_misconf_increment() {
+  local node="$1"
+  local before="$2"
+  local after
+  sleep 2
+  after="$(misconf_count "${node}")"
+  before="${before:-0}"
+  after="${after:-0}"
+  log "POSTCHECK MISCONF before=${before} after=${after} on ${node}"
+  if (( after > before )); then
+    log "POSTCHECK PASS: MISCONF incremented ${before}->${after}"
+    return 0
+  fi
+  log "POSTCHECK FAIL: MISCONF not incremented on ${node}"
+  return 1
+}
+
+post_check_ping_down_sustained() {
+  local node="$1"
+  local seconds="${2:-5}"
+  local min_fail="${3:-3}"
+  local fails=0 i
+  for (( i=0; i<seconds; i++ )); do
+    if ! redis_cmd "${node}" PING >/dev/null 2>&1; then
+      fails=$((fails + 1))
+    fi
+    sleep 1
+  done
+  if (( fails >= min_fail )); then
+    log "POSTCHECK PASS: redis down on ${node} for ${fails}/${seconds}s"
+    return 0
+  fi
+  log "POSTCHECK FAIL: redis still reachable (${fails}/${seconds}s down, need ${min_fail})"
   return 1
 }
 
@@ -450,6 +517,98 @@ emit_inject_result() {
   local status="$2"
   local detail="${3:-}"
   log "INJECT_RESULT scenario=${scenario} status=${status} detail=${detail}"
+}
+
+# --- injection lifecycle (always emit INJECT_RESULT on abort) ---------------
+
+INJECT_SCENARIO=""
+INJECT_RECOVER=""
+INJECT_RESULT_EMITTED=0
+
+inject_on_exit() {
+  local rc=$?
+  if [[ "${INJECT_RESULT_EMITTED}" -eq 1 ]]; then
+    return "${rc}"
+  fi
+  if [[ -n "${INJECT_RECOVER}" ]]; then
+    ${INJECT_RECOVER} || true
+  fi
+  if [[ -n "${INJECT_SCENARIO}" ]]; then
+    emit_inject_result "${INJECT_SCENARIO}" "fail" "aborted rc=${rc}"
+    INJECT_RESULT_EMITTED=1
+  fi
+  return "${rc}"
+}
+
+inject_begin() {
+  INJECT_SCENARIO="$1"
+  INJECT_RECOVER="${2:-}"
+  INJECT_RESULT_EMITTED=0
+  trap inject_on_exit EXIT
+}
+
+inject_pass() {
+  emit_inject_result "${INJECT_SCENARIO}" "pass" "$1"
+  INJECT_RESULT_EMITTED=1
+  trap - EXIT
+}
+
+inject_fail() {
+  local detail="$1"
+  if [[ -n "${INJECT_RECOVER}" ]]; then
+    ${INJECT_RECOVER} || true
+  fi
+  emit_inject_result "${INJECT_SCENARIO}" "fail" "${detail}"
+  INJECT_RESULT_EMITTED=1
+  trap - EXIT
+  exit 1
+}
+
+# Docker Restart=always/unless-stopped defeats F07 if shorter than cluster timeout
+CONTAINER_RESTART_SAVED=""
+
+save_container_restart_policy() {
+  [[ "${INJECT_BACKEND}" == "docker" ]] || return 0
+  ensure_target_container
+  CONTAINER_RESTART_SAVED="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "${TARGET_CONTAINER}" 2>/dev/null || echo unless-stopped)"
+  docker update --restart=no "${TARGET_CONTAINER}" >/dev/null
+  log "disabled auto-restart on ${TARGET_CONTAINER} (was ${CONTAINER_RESTART_SAVED})"
+}
+
+restore_container_restart_policy() {
+  [[ "${INJECT_BACKEND}" == "docker" ]] || return 0
+  [[ -n "${TARGET_CONTAINER}" ]] || return 0
+  [[ -n "${CONTAINER_RESTART_SAVED}" ]] || return 0
+  docker update --restart="${CONTAINER_RESTART_SAVED}" "${TARGET_CONTAINER}" >/dev/null 2>&1 || true
+  log "restored auto-restart=${CONTAINER_RESTART_SAVED} on ${TARGET_CONTAINER}"
+  CONTAINER_RESTART_SAVED=""
+}
+
+misconf_count() {
+  local node="$1"
+  redis_cmd "${node}" INFO ERRORSTATS 2>/dev/null \
+    | grep -i MISCONF | awk -F: '{gsub(/\r/,"",$2); print $2}' | head -1 || echo 0
+}
+
+resolve_io_dir() {
+  local node="${1:-$(first_node)}"
+  if [[ -z "${IO_DIR:-}" || "${IO_DIR}" == "auto" ]]; then
+    resolve_data_dir "${node}"
+    IO_DIR="${REDIS_DATA_DIR}/fault_io"
+    log "IO_DIR=${IO_DIR} (under Redis data dir, not tmpfs)"
+  fi
+}
+
+apply_netem_loss() {
+  local dev="$1"
+  local loss="$2"
+  if run_on_target "tc qdisc replace dev ${dev} root netem loss ${loss}% 2>/dev/null"; then
+    return 0
+  fi
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe sch_netem 2>/dev/null || true
+  fi
+  run_on_target "tc qdisc replace dev ${dev} root netem loss ${loss}%"
 }
 
 # Restart "VM" = docker restart container (simulates host reboot)

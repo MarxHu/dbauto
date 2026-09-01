@@ -21,7 +21,21 @@ ${COMPOSE[@]} build --pull
 echo "==> Starting 4 nodes"
 ${COMPOSE[@]} up -d
 
+echo "==> Verifying memory limits on Redis nodes"
+for ctn in redis-n1 redis-n2 redis-n3; do
+  mem="$(${DOCKER} inspect -f '{{.HostConfig.Memory}}' "${ctn}" 2>/dev/null || echo 0)"
+  if [[ "${mem}" =~ ^[0-9]+$ ]] && [[ "${mem}" -gt 0 ]]; then
+    echo "  ${ctn} mem_limit=$((mem / 1024 / 1024))MB"
+  else
+    echo "  WARN: ${ctn} has no mem_limit — run compose with mem_limit: 1536m for F04"
+  fi
+done
+
 echo "==> Ensuring container-to-container FORWARD is allowed"
+if command -v modprobe >/dev/null 2>&1; then
+  modprobe sch_netem 2>/dev/null || sudo modprobe sch_netem 2>/dev/null || \
+    echo "WARN: sch_netem not loaded; F22 packet-loss needs it on Docker host"
+fi
 # Some hosts have iptables-legacy FORWARD DROP which breaks ICC
 if command -v iptables-legacy >/dev/null 2>&1; then
   iptables-legacy -P FORWARD ACCEPT 2>/dev/null || sudo iptables-legacy -P FORWARD ACCEPT 2>/dev/null || true

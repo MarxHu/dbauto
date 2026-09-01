@@ -26,6 +26,8 @@
 
 容器能力：`NET_ADMIN`（或 privileged），以便 iptables/tc。
 
+**内存配额**：每 Redis 容器 **`mem_limit: 1536m`**（与 `--vm-bytes 85%` 配套；F04 验收 cgroup ≤15% 可用或 ≥85% 已用）。
+
 数据目录：`/var/lib/redis/6379`（与 `CONFIG GET dir` 一致）。
 
 ---

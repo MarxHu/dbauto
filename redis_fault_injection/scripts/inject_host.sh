@@ -10,7 +10,6 @@ CPU_LOAD="${CPU_LOAD:-90}"
 MEM_WORKERS="${MEM_WORKERS:-2}"
 MEM_PERCENT="${MEM_PERCENT:-85}"
 BURST_SEC="${BURST_SEC:-2}"
-CONFIRM="${CONFIRM:-}"
 POSTCHECK_FAILED=0
 
 usage() {
@@ -74,30 +73,22 @@ case "${ACTION}" in
     acquire_inject_lock
     require_target
     parse_duration
-    run_on_target "command -v stress-ng >/dev/null" || die "stress-ng not installed in $(target_label)"
+    inject_begin cpu recover_cpu
+    run_on_target "command -v stress-ng >/dev/null" || inject_fail "stress-ng missing in $(target_label)"
     run_on_target "nohup stress-ng --cpu 0 --cpu-load ${CPU_LOAD} --timeout ${DURATION}s >/tmp/redis_fault_cpu.log 2>&1 &"
-    post_check_cpu 80 || POSTCHECK_FAILED=1
-    if [[ "${POSTCHECK_FAILED}" -eq 1 ]]; then
-      recover_cpu
-      emit_inject_result "cpu" "fail" "post-check cpu<80"
-      exit 1
-    fi
-    emit_inject_result "cpu" "pass" "cpu>=80 on $(target_label)"
+    post_check_cpu 80 || inject_fail "post-check cpu<80"
+    inject_pass "cpu>=80 on $(target_label)"
     run_timed_fault "${DURATION}" recover_cpu
     ;;
   memory)
     acquire_inject_lock
     require_target
     parse_duration
-    run_on_target "command -v stress-ng >/dev/null" || die "stress-ng not installed in $(target_label)"
+    inject_begin memory recover_memory
+    run_on_target "command -v stress-ng >/dev/null" || inject_fail "stress-ng missing in $(target_label)"
     run_on_target "nohup stress-ng --vm ${MEM_WORKERS} --vm-bytes ${MEM_PERCENT}% --timeout ${DURATION}s >/tmp/redis_fault_mem.log 2>&1 &"
-    post_check_memory 15 || POSTCHECK_FAILED=1
-    if [[ "${POSTCHECK_FAILED}" -eq 1 ]]; then
-      recover_memory
-      emit_inject_result "memory" "fail" "post-check mem avail>15%"
-      exit 1
-    fi
-    emit_inject_result "memory" "pass" "memory_available<=15% on $(target_label)"
+    post_check_memory 15 85 || inject_fail "post-check memory not pressured"
+    inject_pass "memory pressured on $(target_label)"
     run_timed_fault "${DURATION}" recover_memory
     ;;
   cpu-spike)

@@ -72,6 +72,7 @@ recover_process_stop() {
     redis-server ${REDIS_CONF} 2>/dev/null || \
     redis-server --port ${node##*:} --dir ${REDIS_DATA_DIR:-/var/lib/redis} --daemonize yes 2>/dev/null || true
   "
+  restore_container_restart_policy
 }
 
 recover_maxmemory() {
@@ -143,11 +144,12 @@ case "${ACTION}" in
     bind_target_from_node "${NODE}"
     resolve_data_dir "${NODE}" || true
     RCLI="$(remote_redis_cli "127.0.0.1" "${port}")"
+    inject_begin process-stop recover_process_stop
+    save_container_restart_policy
     log "stop redis on ${NODE} for ${DURATION}s via ${INJECT_BACKEND} $(target_label)"
     run_on_target "${RCLI} SHUTDOWN NOSAVE 2>/dev/null || systemctl stop ${REDIS_SERVICE} 2>/dev/null || pkill -f 'redis-server' || true"
-    sleep 2
-    post_check_ping_down "${NODE}" || { emit_inject_result "process-stop" "fail" "still pingable"; exit 1; }
-    emit_inject_result "process-stop" "pass" "redis down on ${NODE}"
+    post_check_ping_down_sustained "${NODE}" 5 3 || inject_fail "redis still reachable"
+    inject_pass "redis down on ${NODE}"
     run_timed_fault "${DURATION}" recover_process_stop
     ;;
   maxmemory)

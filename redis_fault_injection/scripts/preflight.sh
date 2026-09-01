@@ -90,6 +90,12 @@ if [[ "${INJECT_BACKEND}" == "docker" ]]; then
           bad "${req} missing in ${ctn} (NODE_SPEC required)"
         fi
       done
+      mem_bytes="$(docker inspect -f '{{.HostConfig.Memory}}' "${ctn}" 2>/dev/null || echo 0)"
+      if [[ "${mem_bytes}" =~ ^[0-9]+$ ]] && [[ "${mem_bytes}" -gt 0 ]]; then
+        ok "memory limit on ${ctn}: $((mem_bytes / 1024 / 1024))MB"
+      else
+        warn "no memory limit on ${ctn} (F04 needs mem_limit, e.g. 1536m per lab/NODE_SPEC.md)"
+      fi
     else
       bad "no docker container for ${host} (set REDIS_CONTAINER_MAP=\"${host}:<name> ...\" or REDIS_CONTAINERS)"
     fi
