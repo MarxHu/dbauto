@@ -1,0 +1,411 @@
+---
+schema_version: v1
+meta:
+  name: TDSQL MySQL V10.3.22.6 分布式 Part1
+  id: tdsql-distributed-part1
+  description: 命令行安装Part1；完成后在赤兔控制台初始化，再导入同版本Part2。
+spec:
+  nodes:
+  - id: tdsql-distributed-part1_node1
+    type: EmptyStartEvent
+    next:
+    - tdsql-distributed-part1_node2
+  - id: tdsql-distributed-part1_node2
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 环境准备
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            [[ $(id -u) -eq 0 ]] || exit 1
+            [[ $(uname -m) == x86_64 ]] || exit 1
+            grep -Eq '^CentOS Linux release (7\.8|7\.9)(\.|[[:space:]])' /etc/redhat-release
+        job_ip_list:
+          value: "${tdsql_control_ips},${tdsql_db_ips},${tdsql_proxy_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: ''
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '3600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part1_node3
+  - id: tdsql-distributed-part1_node3
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 基础环境和依赖配置
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            run_id=$1
+            [[ $run_id =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$ ]] || exit 1
+            mkdir -p /data/tdsql_sops/$run_id/packages
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_deploy_run_id}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '3600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part1_node4
+  - id: tdsql-distributed-part1_node4
+    type: ServiceActivity
+    name: 快速分发文件
+    stage_name: 下发安装包
+    component:
+      code: job_fast_push_file
+      version: v3.0
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v3.0
+          source_tag: job_fast_push_file.biz_cc_id
+        break_line:
+          value: ''
+        download_speed_limit:
+          value: ''
+        job_dispatch_attr:
+          value:
+          - job_account: root
+            job_ip_list: "${tdsql_control_ips}"
+            job_target_path: "/data/tdsql_sops/${tdsql_deploy_run_id}/packages"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_server:
+          value: []
+        job_source_files:
+          value:
+          - file_source: software_install
+            files: "${tdsql_package_source}"
+          - file_source: software_install
+            files: "${tdsql_precheck_source}"
+          - file_source: software_install
+            files: "${tdsql_license_source}"
+        job_source_files_origin:
+          value: file_source
+        job_timeout:
+          value: '3600'
+        select_method:
+          value: manual
+        upload_speed_limit:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part1_node5
+  - id: tdsql-distributed-part1_node5
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 解压与生成配置文件
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            run_id=$1; cluster_name=$2; control_ips=$3; db_ips=$4; proxy_ips=$5; package_source=$6; package_sha256=$7; precheck_source=$8; precheck_sha256=$9; license_source=${10}; license_sha256=${11}; os_password=${12}
+            error() { echo "[ERROR][TDSQL配置] $*" >&2; exit 1; }
+            IFS=, read -r c1 c2 c3 extra <<<"$control_ips"; [[ -z ${extra:-} && -n $c3 ]] || error '管控IP必须为3个'
+            IFS=, read -r d1 d2 d3 extra <<<"$db_ips"; [[ -z ${extra:-} && -n $d3 ]] || error 'DB IP必须为3个'
+            IFS=, read -r p1 p2 extra <<<"$proxy_ips"; [[ -z ${extra:-} && -n $p2 ]] || error 'Proxy IP必须为2个'
+            local_ips=$(hostname -I 2>/dev/null) || local_ips=''; [[ " $local_ips " == *" $c1 "* ]] || exit 0
+            work_dir="/data/tdsql_sops/$run_id"; package_dir="$work_dir/packages"; state_dir="$work_dir/state"; mkdir -p "$work_dir" "$package_dir" "$state_dir"
+            package_file=$(basename -- "$package_source"); precheck_file=$(basename -- "$precheck_source"); license_file=$(basename -- "$license_source")
+            for item in "$package_file:$package_sha256" "$precheck_file:$precheck_sha256" "$license_file:$license_sha256"; do
+              file=${item%%:*}; digest=${item#*:}; [[ -f "$package_dir/$file" ]] || error "缺少已分发文件 $file"; echo "$digest  $package_dir/$file" | sha256sum -c - >/dev/null || error "$file SHA256校验失败"
+            done
+            [[ ! -e "$work_dir/unpack" ]] || error '本批次已存在解压目录，请使用新的tdsql_deploy_run_id'
+            mkdir -p "$work_dir/unpack"
+            case "$package_file" in
+              *.zip) unzip -q "$package_dir/$package_file" -d "$work_dir/unpack" ;;
+              *.tar.gz|*.tgz) tar -xzf "$package_dir/$package_file" -C "$work_dir/unpack" ;;
+              *.tar) tar -xf "$package_dir/$package_file" -C "$work_dir/unpack" ;;
+              *) error 'TDSQL安装包必须是zip、tar.gz、tgz或tar格式' ;;
+            esac
+            mapfile -t install_dirs < <(find "$work_dir/unpack" -type d -name tdsql_install -print)
+            [[ ${#install_dirs[@]} -eq 1 ]] || error "tdsql_install目录数量必须为1，实际为${#install_dirs[@]}"
+            install_dir=${install_dirs[0]}
+            hosts="$install_dir/tdsql_hosts"; vars="$install_dir/group_vars/all"; [[ -f $hosts && -f $vars && -f $install_dir/scripts/environment_set && -f $install_dir/scripts/install_ansible.sh && -f $install_dir/playbooks/tdsql_part1_site.yml && -f $install_dir/playbooks/tdsql_part2_site.yml ]] || error '安装包关键文件不完整'
+            replace_host() { grep -q -E "^$1[[:space:]]+ansible_ssh_host=" "$hosts" || error "tdsql_hosts缺少主机别名$1"; sed -i -E "s#^($1[[:space:]]+ansible_ssh_host=).*#\\1$2#" "$hosts"; }
+            all=($c1 $c2 $c3 $d1 $d2 $d3 $p1 $p2); for index in "${!all[@]}"; do replace_host "tdsql_mac$((index + 1))" "${all[$index]}"; done
+            replace_host tdsql_zk1 "$c1"; replace_host tdsql_zk2 "$c2"; replace_host tdsql_zk3 "$c3"; replace_host tdsql_scheduler1 "$c1"; replace_host tdsql_scheduler2 "$c2"; replace_host tdsql_oss1 "$c1"; replace_host tdsql_oss2 "$c2"; replace_host tdsql_chitu1 "$c1"; replace_host tdsql_chitu2 "$c2"; replace_host tdsql_monitor1 "$c1"; replace_host tdsql_monitor2 "$c2"; replace_host tdsql_db1 "$d1"; replace_host tdsql_db2 "$d2"; replace_host tdsql_db3 "$d3"; replace_host tdsql_proxy1 "$p1"; replace_host tdsql_proxy2 "$p2"
+            [[ $os_password =~ ^[^[:space:]\"\\\\]{12,128}$ ]] || error 'tdsql_os_password格式不符合厂商限制'
+            yaml_scalar() { value=$1; escaped=${value//\'/\'\'}; printf "'%s'" "$escaped"; }
+            write_yaml_value() {
+              key=$1; value=$2; tmp=$(mktemp "$state_dir/group_vars.XXXXXX"); quoted=$(yaml_scalar "$value"); found=0
+              while IFS= read -r line || [[ -n $line ]]; do
+                if [[ $line == "$key:"* ]]; then printf '%s: %s\n' "$key" "$quoted" >>"$tmp"; found=1; else printf '%s\n' "$line" >>"$tmp"; fi
+              done <"$vars"
+              [[ $found -eq 1 ]] || { find "$tmp" -delete; error "group_vars/all缺少$key"; }
+              chmod 0600 "$tmp"; mv -f "$tmp" "$vars"
+            }
+            write_yaml_value tdsql_os_pass "$os_password"
+            identity=$(printf 'cluster=%s|control=%s|db=%s|proxy=%s' "$cluster_name" "$control_ips" "$db_ips" "$proxy_ips")
+            fingerprint=$(printf '%s' "$identity" | sha256sum | awk '{print $1}')
+            printf '%s\n' "$fingerprint" >"$state_dir/cluster.fingerprint"
+            printf 'cluster_name=%s\ncontrol_ips=%s\ndb_ips=%s\nproxy_ips=%s\n' "$cluster_name" "$control_ips" "$db_ips" "$proxy_ips" >"$state_dir/cluster.identity"
+            printf '%s\n' "$precheck_file" >"$state_dir/precheck.filename"
+            printf '%s\n' "$license_file" >"$state_dir/license.filename"
+            printf '%s\n' "$install_dir" >"$work_dir/install_dir"; chmod 0600 "$vars" "$work_dir/install_dir" "$state_dir"/*
+            echo "[INFO] 集群$cluster_name的TDSQL inventory和group_vars/all已按3+3+2拓扑生成"
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_deploy_run_id}' '${tdsql_cluster_name}' '${tdsql_control_ips}'
+            '${tdsql_db_ips}' '${tdsql_proxy_ips}' '${tdsql_package_source}' '${tdsql_package_sha256}'
+            '${tdsql_precheck_source}' '${tdsql_precheck_sha256}' '${tdsql_license_source}'
+            '${tdsql_license_sha256}' '${tdsql_os_password}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '1800'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part1_node6
+  - id: tdsql-distributed-part1_node6
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 预安装和核心部署
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            run_id=$1; control_ips=$2
+            IFS=, read -r c1 _ <<<"$control_ips"; local_ips=$(hostname -I 2>/dev/null) || local_ips=''; [[ " $local_ips " == *" $c1 "* ]] || exit 0
+            work_dir="/data/tdsql_sops/$run_id"; state_dir="$work_dir/state"; install_dir=$(cat "$work_dir/install_dir"); package_dir="$work_dir/packages"
+            [[ -s "$state_dir/cluster.fingerprint" && -s "$state_dir/precheck.filename" ]] || { echo '[ERROR] Part1配置状态不完整' >&2; exit 1; }
+            precheck_file="$package_dir/$(cat "$state_dir/precheck.filename")"
+            [[ -f $precheck_file ]] || { echo '[ERROR] 未找到用户输入的PreCheck包' >&2; exit 1; }
+            [[ ! -e "$work_dir/precheck" ]] || { echo '[ERROR] 本批次PreCheck目录已存在，请使用新的tdsql_deploy_run_id' >&2; exit 1; }
+            mkdir -p "$work_dir/precheck"; unzip -q "$precheck_file" -d "$work_dir/precheck"
+            mapfile -t precheck_scripts < <(find "$work_dir/precheck" -type f -name pre_autotest_install_v1.1.sh -print)
+            [[ ${#precheck_scripts[@]} -eq 1 ]] || { echo "[ERROR] PreCheck入口数量必须为1，实际为${#precheck_scripts[@]}" >&2; exit 1; }
+            precheck_dir=$(dirname "${precheck_scripts[0]}"); cp "$install_dir/tdsql_hosts" "$precheck_dir/tdsql_hosts"
+            cd "$precheck_dir"; sh pre_autotest_install_v1.1.sh docker; sh pre_autotest_install_v1.1.sh precheck 22 tdsql
+            cd "$install_dir"; source scripts/environment_set; sh scripts/install_ansible.sh; ansible --version
+            ansible-playbook -i tdsql_hosts playbooks/tdsql_part1_site.yml | tee "$work_dir/part1.log"
+            grep -Eq 'failed=0' "$work_dir/part1.log" && grep -Eq 'unreachable=0' "$work_dir/part1.log" || { echo '[ERROR] Part1未确认failed=0且unreachable=0' >&2; exit 1; }
+            status_tmp=$(mktemp "$state_dir/part1.success.XXXXXX")
+            printf 'status=success\nfingerprint=%s\ncompleted_at=%s\n' "$(cat "$state_dir/cluster.fingerprint")" "$(date -u +%FT%TZ)" >"$status_tmp"
+            chmod 0600 "$status_tmp"; mv -f "$status_tmp" "$state_dir/part1.success"
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_deploy_run_id}' '${tdsql_control_ips}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '7200'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part1_node7
+  - id: tdsql-distributed-part1_node7
+    type: EmptyEndEvent
+  constants:
+    "${tdsql_deploy_run_id}":
+      name: 部署批次
+      value: ''
+      type: input
+      validation: "^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$"
+    "${tdsql_cluster_name}":
+      name: 集群名称
+      value: ''
+      type: input
+      validation: "^[A-Za-z][A-Za-z0-9_-]{2,63}$"
+    "${tdsql_control_ips}":
+      name: 3台管控IP（有序）
+      value: ''
+      type: input
+      validation: "^([^,[:space:]]+,){2}[^,[:space:]]+$"
+    "${tdsql_db_ips}":
+      name: 3台DB IP（有序）
+      value: ''
+      type: input
+      validation: "^([^,[:space:]]+,){2}[^,[:space:]]+$"
+    "${tdsql_proxy_ips}":
+      name: 2台Proxy IP（有序）
+      value: ''
+      type: input
+      validation: "^[^,[:space:]]+,[^,[:space:]]+$"
+    "${tdsql_package_source}":
+      name: TDSQL安装包文件源
+      value: ''
+      type: input
+      validation: "^[^']+$"
+    "${tdsql_package_sha256}":
+      name: TDSQL安装包SHA256
+      value: ''
+      type: input
+      validation: "^[A-Fa-f0-9]{64}$"
+    "${tdsql_precheck_source}":
+      name: PreCheck包文件源
+      value: ''
+      type: input
+      validation: "^[^']+$"
+    "${tdsql_precheck_sha256}":
+      name: PreCheck包SHA256
+      value: ''
+      type: input
+      validation: "^[A-Fa-f0-9]{64}$"
+    "${tdsql_license_source}":
+      name: License压缩包文件源
+      value: ''
+      type: input
+      validation: "^[^']+$"
+    "${tdsql_license_sha256}":
+      name: License包SHA256
+      value: ''
+      type: input
+      validation: "^[A-Fa-f0-9]{64}$"
+    "${tdsql_os_password}":
+      name: tdsql操作系统账户密码
+      value: ''
+      type: input
+      validation: ^[^[:space:]"\\]{12,128}$

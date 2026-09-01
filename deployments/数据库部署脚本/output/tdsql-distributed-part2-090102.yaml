@@ -1,0 +1,250 @@
+---
+schema_version: v1
+meta:
+  name: TDSQL MySQL V10.3.22.6 分布式 Part2
+  id: tdsql-distributed-part2
+  description: 仅在赤兔控制台初始化完成后运行；自动安装clouddba、onlineddl、collector。
+spec:
+  nodes:
+  - id: tdsql-distributed-part2_node1
+    type: EmptyStartEvent
+    next:
+    - tdsql-distributed-part2_node2
+  - id: tdsql-distributed-part2_node2
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 更新赤兔监控库配置
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            run_id=$1; control_ips=$2; metadb_ip=$3; metadb_port=$4; metadb_ip_bak=$5; metadb_port_bak=$6; metadb_user=$7; metadb_password=$8
+            IFS=, read -r c1 _ <<<"$control_ips"; local_ips=$(hostname -I 2>/dev/null) || local_ips=''; [[ " $local_ips " == *" $c1 "* ]] || exit 0
+            [[ $metadb_port =~ ^[1-9][0-9]{0,4}$ && $metadb_port_bak =~ ^[1-9][0-9]{0,4}$ ]] || { echo '[ERROR] 监控库端口非法' >&2; exit 1; }
+            [[ $metadb_user =~ ^[A-Za-z][A-Za-z0-9_]{0,31}$ && $metadb_password =~ ^[^[:space:]\"\\\\]{12,128}$ ]] || { echo '[ERROR] 监控库账号或密码格式非法' >&2; exit 1; }
+            work_dir="/data/tdsql_sops/$run_id"; state_dir="$work_dir/state"; install_dir=$(cat "$work_dir/install_dir"); vars="$install_dir/group_vars/all"; [[ -f $vars ]] || { echo '[ERROR] 未找到Part1生成的group_vars/all' >&2; exit 1; }
+            [[ -s "$state_dir/part1.success" && -s "$state_dir/cluster.fingerprint" && -s "$state_dir/cluster.identity" ]] || { echo '[ERROR] Part1成功状态或cluster.fingerprint缺失' >&2; exit 1; }
+            fingerprint=$(cat "$state_dir/cluster.fingerprint"); grep -q "^fingerprint=$fingerprint$" "$state_dir/part1.success" || { echo '[ERROR] Part1状态指纹不一致' >&2; exit 1; }
+            saved_control_ips=$(awk -F= '$1=="control_ips" {sub(/^[^=]*=/, ""); print; exit}' "$state_dir/cluster.identity")
+            [[ $saved_control_ips == "$control_ips" ]] || { echo '[ERROR] Part2管控IP与Part1批次不一致' >&2; exit 1; }
+            yaml_scalar() { value=$1; escaped=${value//\'/\'\'}; printf "'%s'" "$escaped"; }
+            set_value() {
+              key=$1; value=$2; tmp=$(mktemp "$state_dir/group_vars.XXXXXX"); quoted=$(yaml_scalar "$value"); found=0
+              while IFS= read -r line || [[ -n $line ]]; do
+                if [[ $line == "$key:"* ]]; then printf '%s: %s\n' "$key" "$quoted" >>"$tmp"; found=1; else printf '%s\n' "$line" >>"$tmp"; fi
+              done <"$vars"
+              [[ $found -eq 1 ]] || { find "$tmp" -delete; echo "[ERROR] 缺少变量$key" >&2; exit 1; }
+              chmod 0600 "$tmp"; mv -f "$tmp" "$vars"
+            }
+            set_value tdsql_metadb_ip "$metadb_ip"; set_value tdsql_metadb_port "$metadb_port"; set_value tdsql_metadb_ip_bak "$metadb_ip_bak"; set_value tdsql_metadb_port_bak "$metadb_port_bak"; set_value tdsql_metadb_user "$metadb_user"; set_value tdsql_metadb_password "$metadb_password"; chmod 0600 "$vars"
+            echo '[INFO] 赤兔监控库参数已写入group_vars/all'
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_deploy_run_id}' '${tdsql_control_ips}' '${tdsql_metadb_ip}'
+            '${tdsql_metadb_port}' '${tdsql_metadb_ip_bak}' '${tdsql_metadb_port_bak}'
+            '${tdsql_metadb_user}' '${tdsql_metadb_password}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '3600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part2_node3
+  - id: tdsql-distributed-part2_node3
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: Part2自动化安装
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            run_id=$1; control_ips=$2
+            IFS=, read -r c1 _ <<<"$control_ips"; local_ips=$(hostname -I 2>/dev/null) || local_ips=''; [[ " $local_ips " == *" $c1 "* ]] || exit 0
+            work_dir="/data/tdsql_sops/$run_id"; state_dir="$work_dir/state"; install_dir=$(cat "$work_dir/install_dir"); [[ -s "$state_dir/part1.success" ]] || { echo '[ERROR] Part1未成功' >&2; exit 1; }
+            cd "$install_dir"; source scripts/environment_set; ansible-playbook -i tdsql_hosts playbooks/tdsql_part2_site.yml | tee "$work_dir/part2.log"; grep -Eq 'failed=0' "$work_dir/part2.log" && grep -Eq 'unreachable=0' "$work_dir/part2.log" || { echo '[ERROR] Part2未确认failed=0且unreachable=0' >&2; exit 1; }
+            status_tmp=$(mktemp "$state_dir/part2.success.XXXXXX")
+            printf 'status=success\nfingerprint=%s\ncompleted_at=%s\n' "$(cat "$state_dir/cluster.fingerprint")" "$(date -u +%FT%TZ)" >"$status_tmp"
+            chmod 0600 "$status_tmp"; mv -f "$status_tmp" "$state_dir/part2.success"
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_deploy_run_id}' '${tdsql_control_ips}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '7200'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part2_node4
+  - id: tdsql-distributed-part2_node4
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 最终验证
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            run_id=$1; control_ips=$2
+            IFS=, read -r c1 _ <<<"$control_ips"; local_ips=$(hostname -I 2>/dev/null) || local_ips=''; [[ " $local_ips " == *" $c1 "* ]] || exit 0
+            work_dir="/data/tdsql_sops/$run_id"; state_dir="$work_dir/state"; install_dir=$(cat "$work_dir/install_dir"); [[ -s "$state_dir/part2.success" ]] || { echo '[ERROR] Part2成功状态缺失' >&2; exit 1; }
+            cd "$install_dir"; source scripts/environment_set
+            required_groups='tdsql_zk:tdsql_scheduler:tdsql_oss:tdsql_chitu:tdsql_monitor:tdsql_db:tdsql_proxy'
+            ansible -i tdsql_hosts "$required_groups" -m ping | tee "$work_dir/verify.log"
+            expected_hosts=$(ansible -i tdsql_hosts "$required_groups" --list-hosts | awk '/^[[:space:]]+[^[:space:]]/ {count++} END {print count+0}')
+            success_hosts=$(grep -c 'SUCCESS' "$work_dir/verify.log")
+            [[ $expected_hosts -gt 0 && $success_hosts -eq $expected_hosts ]] || { echo "[ERROR] 预期$expected_hosts台成功，实际$success_hosts台" >&2; exit 1; }
+            echo '[INFO] Part2完成。请在赤兔创建2分片、每分片一主两备的业务实例，然后运行Part3。'
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_deploy_run_id}' '${tdsql_control_ips}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '3600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: false
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part2_node5
+  - id: tdsql-distributed-part2_node5
+    type: EmptyEndEvent
+  constants:
+    "${tdsql_deploy_run_id}":
+      name: 部署批次
+      value: ''
+      type: input
+      validation: "^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$"
+    "${tdsql_control_ips}":
+      name: 3台管控IP（有序）
+      value: ''
+      type: input
+      validation: "^([^,[:space:]]+,){2}[^,[:space:]]+$"
+    "${tdsql_metadb_ip}":
+      name: tdsql_metadb_ip
+      value: ''
+      type: input
+      validation: "^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$"
+    "${tdsql_metadb_ip_bak}":
+      name: tdsql_metadb_ip_bak
+      value: ''
+      type: input
+      validation: "^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$"
+    "${tdsql_metadb_port}":
+      name: tdsql_metadb_port
+      value: ''
+      type: input
+      validation: "^[1-9][0-9]{0,4}$"
+    "${tdsql_metadb_port_bak}":
+      name: tdsql_metadb_port_bak
+      value: ''
+      type: input
+      validation: "^[1-9][0-9]{0,4}$"
+    "${tdsql_metadb_user}":
+      name: 监控库账号
+      value: ''
+      type: input
+      validation: "^[A-Za-z][A-Za-z0-9_]{0,31}$"
+    "${tdsql_metadb_password}":
+      name: 监控库密码
+      value: ''
+      type: input
+      validation: ^[^[:space:]"\\]{12,128}$

@@ -1,0 +1,271 @@
+---
+schema_version: v1
+meta:
+  name: TDSQL MySQL V10.3.22.6 分布式 Part3业务实例验收
+  id: tdsql-distributed-part3
+  description: 仅在Part2成功且已在赤兔创建2分片、每分片一主两备的业务实例后运行；自动验证两个Proxy的登录与SQL读写。
+spec:
+  nodes:
+  - id: tdsql-distributed-part3_node1
+    type: EmptyStartEvent
+    next:
+    - tdsql-distributed-part3_node2
+  - id: tdsql-distributed-part3_node2
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 验收前检查
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            acceptance_run_id=$1; run_id=$2; control_ips=$3; proxy1_ip=$4; proxy1_port=$5; proxy2_ip=$6; proxy2_port=$7; admin_user=$8
+            IFS=, read -r c1 _ <<<"$control_ips"; local_ips=$(hostname -I 2>/dev/null) || local_ips=''; [[ " $local_ips " == *" $c1 "* ]] || exit 0
+            [[ $acceptance_run_id =~ ^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$ ]] || { echo '[ERROR] 验收批次非法' >&2; exit 1; }
+            [[ $proxy1_port =~ ^[1-9][0-9]{0,4}$ && $proxy2_port =~ ^[1-9][0-9]{0,4}$ ]] || { echo '[ERROR] Proxy端口非法' >&2; exit 1; }
+            [[ $admin_user =~ ^[A-Za-z][A-Za-z0-9_]{0,31}$ ]] || { echo '[ERROR] 实例管理员账号非法' >&2; exit 1; }
+            [[ "$proxy1_ip:$proxy1_port" != "$proxy2_ip:$proxy2_port" ]] || { echo '[ERROR] 两个Proxy端点不能相同' >&2; exit 1; }
+            command -v mysql >/dev/null || { echo '[ERROR] control1缺少兼容MySQL客户端' >&2; exit 1; }
+            work_dir="/data/tdsql_sops/$run_id"; state_dir="$work_dir/state"; [[ -s "$state_dir/part2.success" ]] || { echo '[ERROR] Part2成功状态缺失' >&2; exit 1; }
+            saved_control_ips=$(awk -F= '$1=="control_ips" {sub(/^[^=]*=/, ""); print; exit}' "$state_dir/cluster.identity")
+            [[ $saved_control_ips == "$control_ips" ]] || { echo '[ERROR] Part3管控IP与部署批次不一致' >&2; exit 1; }
+            timeout 5 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$proxy1_ip" "$proxy1_port" || { echo '[ERROR] Proxy1 TCP不可达' >&2; exit 1; }
+            timeout 5 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$proxy2_ip" "$proxy2_port" || { echo '[ERROR] Proxy2 TCP不可达' >&2; exit 1; }
+            acceptance_dir="$work_dir/acceptance/$acceptance_run_id"; [[ ! -e $acceptance_dir ]] || { echo '[ERROR] 验收批次已存在，请使用新的tdsql_acceptance_run_id' >&2; exit 1; }
+            mkdir -p "$acceptance_dir"; chmod 0700 "$acceptance_dir"
+            printf 'proxy1=%s:%s\nproxy2=%s:%s\nadmin_user=%s\n' "$proxy1_ip" "$proxy1_port" "$proxy2_ip" "$proxy2_port" "$admin_user" >"$acceptance_dir/inputs"
+            printf 'status=success\n' >"$acceptance_dir/precheck.success"; chmod 0600 "$acceptance_dir"/*
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_acceptance_run_id}' '${tdsql_deploy_run_id}' '${tdsql_control_ips}'
+            '${tdsql_proxy1_ip}' '${tdsql_proxy1_port}' '${tdsql_proxy2_ip}' '${tdsql_proxy2_port}'
+            '${tdsql_instance_admin_user}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '3600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part3_node3
+  - id: tdsql-distributed-part3_node3
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 双Proxy读写验收
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            acceptance_run_id=$1; run_id=$2; control_ips=$3; proxy1_ip=$4; proxy1_port=$5; proxy2_ip=$6; proxy2_port=$7; admin_user=$8; admin_password=$9
+            IFS=, read -r c1 _ <<<"$control_ips"; local_ips=$(hostname -I 2>/dev/null) || local_ips=''; [[ " $local_ips " == *" $c1 "* ]] || exit 0
+            work_dir="/data/tdsql_sops/$run_id"; acceptance_dir="$work_dir/acceptance/$acceptance_run_id"; [[ -s "$acceptance_dir/precheck.success" ]] || { echo '[ERROR] 验收前检查未通过' >&2; exit 1; }
+            mysql_bin=$(command -v mysql); db_suffix=$(printf '%s' "$acceptance_run_id" | tr -c 'A-Za-z0-9_' '_'); db_name="tdsql_sops_$db_suffix"
+            option1=$(mktemp "$acceptance_dir/mysql-proxy1.XXXXXX"); option2=$(mktemp "$acceptance_dir/mysql-proxy2.XXXXXX")
+            cleanup_sensitive() {
+              for sensitive_file in "$option1" "$option2"; do : >"$sensitive_file" 2>/dev/null || :; find "$sensitive_file" -delete 2>/dev/null || :; done
+            }
+            trap cleanup_sensitive EXIT
+            printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\nprotocol=TCP\n' "$admin_user" "$admin_password" "$proxy1_ip" "$proxy1_port" >"$option1"
+            printf '[client]\nuser=%s\npassword=%s\nhost=%s\nport=%s\nprotocol=TCP\n' "$admin_user" "$admin_password" "$proxy2_ip" "$proxy2_port" >"$option2"
+            chmod 0600 "$option1" "$option2"
+            mysql1=("$mysql_bin" "--defaults-extra-file=$option1" --batch --skip-column-names --raw --connect-timeout=10)
+            mysql2=("$mysql_bin" "--defaults-extra-file=$option2" --batch --skip-column-names --raw --connect-timeout=10)
+            "${mysql1[@]}" -e 'SELECT 1' >/dev/null
+            "${mysql2[@]}" -e 'SELECT 1' >/dev/null
+            "${mysql1[@]}" -e "CREATE DATABASE \`$db_name\`"
+            "${mysql1[@]}" "$db_name" -e "CREATE TABLE sops_owner (run_id VARCHAR(64) PRIMARY KEY); INSERT INTO sops_owner VALUES ('$acceptance_run_id'); CREATE TABLE rw_probe (id INT PRIMARY KEY, marker VARCHAR(64), value INT); INSERT INTO rw_probe VALUES (1, '$acceptance_run_id', 1);"
+            first_read=$("${mysql2[@]}" "$db_name" -e 'SELECT CONCAT(marker,CHAR(58),value) FROM rw_probe WHERE id=1')
+            [[ $first_read == "$acceptance_run_id:1" ]] || { echo '[ERROR] Proxy2未读取到Proxy1写入结果；失败时保留临时数据库' >&2; exit 1; }
+            "${mysql1[@]}" "$db_name" -e 'UPDATE rw_probe SET value=2 WHERE id=1'
+            second_read=$("${mysql2[@]}" "$db_name" -e 'SELECT CONCAT(marker,CHAR(58),value) FROM rw_probe WHERE id=1')
+            [[ $second_read == "$acceptance_run_id:2" ]] || { echo '[ERROR] 双Proxy更新读取不一致；失败时保留临时数据库' >&2; exit 1; }
+            owner=$("${mysql1[@]}" "$db_name" -e 'SELECT run_id FROM sops_owner')
+            [[ $owner == "$acceptance_run_id" ]] || { echo '[ERROR] 临时数据库所有权标记不一致，拒绝清理' >&2; exit 1; }
+            "${mysql1[@]}" -e "DROP DATABASE \`$db_name\`"
+            printf 'status=success\nproxy1=%s:%s\nproxy2=%s:%s\ncompleted_at=%s\n' "$proxy1_ip" "$proxy1_port" "$proxy2_ip" "$proxy2_port" "$(date -u +%FT%TZ)" >"$acceptance_dir/acceptance.success"
+            chmod 0600 "$acceptance_dir/acceptance.success"
+            echo '[INFO] 双Proxy登录、写入、更新和跨Proxy读取通过；临时数据库已清理'
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_acceptance_run_id}' '${tdsql_deploy_run_id}' '${tdsql_control_ips}'
+            '${tdsql_proxy1_ip}' '${tdsql_proxy1_port}' '${tdsql_proxy2_ip}' '${tdsql_proxy2_port}'
+            '${tdsql_instance_admin_user}' '${tdsql_instance_admin_password}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '1800'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part3_node4
+  - id: tdsql-distributed-part3_node4
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 验收结果
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            acceptance_run_id=$1; run_id=$2; control_ips=$3
+            IFS=, read -r c1 _ <<<"$control_ips"; local_ips=$(hostname -I 2>/dev/null) || local_ips=''; [[ " $local_ips " == *" $c1 "* ]] || exit 0
+            receipt="/data/tdsql_sops/$run_id/acceptance/$acceptance_run_id/acceptance.success"
+            [[ -s $receipt ]] || { echo '[ERROR] acceptance.success缺失' >&2; exit 1; }
+            grep -q '^status=success$' "$receipt" || { echo '[ERROR] 验收回执状态异常' >&2; exit 1; }
+            echo '[INFO] 业务分布式实例功能验收通过；2分片×一主两备拓扑须以赤兔截图为交付证据'
+        job_ip_list:
+          value: "${tdsql_control_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${tdsql_acceptance_run_id}' '${tdsql_deploy_run_id}' '${tdsql_control_ips}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '3600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: false
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - tdsql-distributed-part3_node5
+  - id: tdsql-distributed-part3_node5
+    type: EmptyEndEvent
+  constants:
+    "${tdsql_acceptance_run_id}":
+      name: 验收批次
+      value: ''
+      type: input
+      validation: "^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$"
+    "${tdsql_deploy_run_id}":
+      name: 部署批次
+      value: ''
+      type: input
+      validation: "^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$"
+    "${tdsql_control_ips}":
+      name: 3台管控IP（有序）
+      value: ''
+      type: input
+      validation: "^([^,[:space:]]+,){2}[^,[:space:]]+$"
+    "${tdsql_proxy1_ip}":
+      name: Proxy1 IP
+      value: ''
+      type: input
+      validation: "^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$"
+    "${tdsql_proxy1_port}":
+      name: Proxy1端口
+      value: ''
+      type: input
+      validation: "^[1-9][0-9]{0,4}$"
+    "${tdsql_proxy2_ip}":
+      name: Proxy2 IP
+      value: ''
+      type: input
+      validation: "^((25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})$"
+    "${tdsql_proxy2_port}":
+      name: Proxy2端口
+      value: ''
+      type: input
+      validation: "^[1-9][0-9]{0,4}$"
+    "${tdsql_instance_admin_user}":
+      name: 实例管理员账号
+      value: ''
+      type: input
+      validation: "^[A-Za-z][A-Za-z0-9_]{0,31}$"
+    "${tdsql_instance_admin_password}":
+      name: 实例管理员密码
+      value: ''
+      type: input
+      validation: ^[^[:space:]"\\]{12,128}$
