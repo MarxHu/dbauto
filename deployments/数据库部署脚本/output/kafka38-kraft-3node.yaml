@@ -289,6 +289,7 @@ spec:
               curl -fsSL "$tarball_url" -o "$tarball"
             fi
             [[ -n "$tarball_sha512" ]] || error "未配置 tar.gz SHA512"
+            tarball_sha512=$(echo "${tarball_sha512}" | tr '[:upper:]' '[:lower:]')
             echo "${tarball_sha512}  ${tarball}" | sha512sum -c -
             rm -rf "kafka_${scala_version}-${kafka_version}"
             tar -xzf "$tarball"
@@ -867,12 +868,12 @@ spec:
       validation: ^/.+
     "${kafka_tarball_url}":
       name: Kafka官方tar.gz下载地址
-      value: https://downloads.apache.org/kafka/3.8.1/kafka_2.13-3.8.1.tgz
+      value: https://archive.apache.org/dist/kafka/3.8.1/kafka_2.13-3.8.1.tgz
       type: input
       validation: ^https?://.+
     "${kafka_tarball_sha512}":
       name: Kafka tar.gz SHA512
-      value: B43FADA353B7DCA51C0F90ACF594EC1CE06B2344C046D4059D4DEAB0615E0E3E76E92CCDBDFA1ADAD1FBDE76C5F25E71ACD0DB013FB4B1778827448B5285EDF
+      value: b43fada353b7dca51c0f90acf594ec1ce06b2344c046d4059d4deab0615e0e3e76e92eccdbdfa1adad1fbde76c5f25e71acd0db013fb4b1778827448b5285edf
       type: input
       validation: ^[0-9A-Fa-f]{128}$
     "${kafka_cluster_id}":
