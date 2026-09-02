@@ -24,7 +24,20 @@ ${COMPOSE[@]} build
 echo "==> Starting 3 Docker nodes on 10.10.26.0/24"
 ${COMPOSE[@]} up -d --force-recreate
 
-echo "==> Ensuring container-to-container FORWARD is allowed"
+echo "==> Network policy: ICC on, leftover 10.10.26 bridges gone, FORWARD ACCEPT"
+# Nested overlay hosts often leave a down bridge on the same subnet; that breaks ICMP/TCP.
+while read -r br; do
+  [[ -n "${br}" ]] || continue
+  if ip -br addr show "${br}" 2>/dev/null | grep -q '10\.10\.26\.1'; then
+    if [[ "$(ip -br link show "${br}" 2>/dev/null | awk '{print $2}')" == "DOWN" ]]; then
+      echo "  delete leftover ${br}"
+      sudo ip link delete "${br}" 2>/dev/null || true
+    fi
+  fi
+done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+# br_netfilter + Docker DROP rules can blackhole same-bridge traffic in this VM.
+sudo sysctl -w net.bridge.bridge-nf-call-iptables=0 >/dev/null 2>&1 || true
+sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=0 >/dev/null 2>&1 || true
 if command -v iptables >/dev/null 2>&1; then
   sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
   sudo iptables -C FORWARD -j ACCEPT 2>/dev/null \

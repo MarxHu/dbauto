@@ -24,8 +24,9 @@
 ## 2. 网络策略
 
 - Docker bridge `kafka_lab`，子网 `10.10.26.0/24`，`enable_icc=true`
-- 宿主机 `FORWARD` 策略 `ACCEPT`，保证容器互访
-- 节点间必须互通 `9092/tcp` 与 `9093/tcp`
+- 宿主机 `FORWARD` 策略 `ACCEPT`；清理同网段残留 DOWN bridge
+- 关闭 `net.bridge.bridge-nf-call-iptables`，避免 Docker DROP 误伤同桥互访
+- 节点间必须互通 ICMP 与 `9092/tcp`、`9093/tcp`
 
 ## 3. 交付方式
 
