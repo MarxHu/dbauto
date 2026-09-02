@@ -1,0 +1,2870 @@
+---
+schema_version: v1
+meta:
+  name: Kafka KRaft三节点排障优化版（覆盖复盘后）
+  id: kafka38-kraft-troubleshoot-v2
+  description: >
+    基于 KAFKA_FAULT_SCENARIOS.md 复盘：在 v1 五路采集之上增加采集预检、
+    采集失败降级清洗、ignore_error 贯穿、信号映射到 KF 场景 ID、KRaft quorum/
+    URP/Offline/消费组/log.dirs/JVM/时钟/产消探针。清洗后进入 AI 诊断。
+spec:
+  nodes:
+  - id: kafka-ts_start
+    type: EmptyStartEvent
+    next:
+    - kafka-ts_precheck
+  - id: kafka-ts_precheck
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 采集预检
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # 采集预检（v2）：工具与路径是否具备，不阻断后续并行采集
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            kafka_port=${5:-9092}
+            controller_port=${6:-9093}
+            run_id=${7:-manual}
+            
+            target_ip=$(resolve_local_ip "$node1" "$node2" "$node3")
+            begin_artifact precheck "$target_ip" "$run_id"
+            emit "collector=precheck"
+            
+            for c in bash ss pgrep hostname; do
+              if command -v "$c" >/dev/null 2>&1; then
+                emit "HAS ${c}"
+              else
+                emit "MISS ${c}"
+                signal KF118 medium "missing ${c}"
+              fi
+            done
+            for c in iostat jstat timeout vmstat tc iptables; do
+              if command -v "$c" >/dev/null 2>&1; then
+                emit "HAS ${c}"
+              else
+                emit "MISS_OPTIONAL ${c}"
+                signal KF118 low "optional missing ${c}"
+              fi
+            done
+            
+            api=$(kafka_bin kafka-broker-api-versions.sh || true)
+            if [[ -n "$api" ]]; then
+              emit "HAS ${api}"
+            else
+              emit "MISS kafka CLI"
+              signal KF118 high "Kafka CLI missing under ${KAFKA_INSTALL_PREFIX}"
+            fi
+            
+            [[ -f /etc/kafka/server.properties ]] && emit "HAS server.properties" || emit "MISS server.properties"
+            [[ -d /var/log/kafka ]] && emit "HAS /var/log/kafka" || emit "MISS /var/log/kafka"
+            [[ -d /var/lib/kafka/data ]] && emit "HAS /var/lib/kafka/data" || emit "MISS /var/lib/kafka/data"
+            
+            pgrep -f 'kafka\.Kafka' >/dev/null 2>&1 && emit "PROCESS_UP" || { emit "PROCESS_DOWN"; signal KF015 medium "precheck process down"; }
+            
+            ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":${kafka_port}$" && emit "LISTEN ${kafka_port}" || emit "NOLISTEN ${kafka_port}"
+            ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":${controller_port}$" && emit "LISTEN ${controller_port}" || emit "NOLISTEN ${controller_port}"
+            
+            finish_artifact
+            exit 0
+        job_ip_list:
+          value: "${kafka_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '180'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_parallel
+  - id: kafka-ts_parallel
+    type: ParallelGateway
+    name: 五路并行采集
+    next:
+    - kafka-ts_metrics
+    - kafka-ts_config
+    - kafka-ts_logs
+    - kafka-ts_host
+    - kafka-ts_network
+  - id: kafka-ts_metrics
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 采集监控指标(含Quorum/URP/消费组/探针)
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # K1 集群监控指标：Broker API、Topic/URP/Offline、KRaft quorum、消费组、log.dirs、产消探针
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            kafka_port=${5:-9092}
+            controller_port=${6:-9093}
+            run_id=${7:-manual}
+            topic_hint=${8:-deploy-verify}
+            
+            target_ip=$(resolve_local_ip "$node1" "$node2" "$node3")
+            begin_artifact metrics "$target_ip" "$run_id"
+            
+            emit "collector=metrics"
+            emit "kafka_port=${kafka_port} controller_port=${controller_port}"
+            emit "install_prefix=${KAFKA_INSTALL_PREFIX}"
+            
+            bootstrap="${node1}:${kafka_port},${node2}:${kafka_port},${node3}:${kafka_port}"
+            local_bs="${target_ip}:${kafka_port}"
+            emit "bootstrap=${bootstrap}"
+            emit "local_bootstrap=${local_bs}"
+            
+            api_bin=$(kafka_bin kafka-broker-api-versions.sh || true)
+            topics_bin=$(kafka_bin kafka-topics.sh || true)
+            groups_bin=$(kafka_bin kafka-consumer-groups.sh || true)
+            logdirs_bin=$(kafka_bin kafka-log-dirs.sh || true)
+            quorum_bin=$(kafka_bin kafka-metadata-quorum.sh || true)
+            producer_bin=$(kafka_bin kafka-console-producer.sh || true)
+            consumer_bin=$(kafka_bin kafka-console-consumer.sh || true)
+            configs_bin=$(kafka_bin kafka-configs.sh || true)
+            
+            if [[ -z "$api_bin" ]]; then
+              signal KF024 high "kafka-broker-api-versions.sh missing"
+              emit "ERROR missing Kafka CLI under ${KAFKA_INSTALL_PREFIX}"
+              finish_artifact
+              exit 0
+            fi
+            
+            local_api_ok=0
+            if emit_cmd_timeout 15 "broker-api-versions local" "$api_bin" --bootstrap-server "$local_bs"; then
+              local_api_ok=1
+            else
+              signal KF015 high "local broker API unreachable ${local_bs}"
+              signal KF038 medium "Leader/API may be unavailable on ${target_ip}"
+            fi
+            
+            cluster_api_ok=0
+            if emit_cmd_timeout 20 "broker-api-versions cluster" "$api_bin" --bootstrap-server "$bootstrap"; then
+              cluster_api_ok=1
+            else
+              signal KF026 high "cluster bootstrap API failed"
+            fi
+            
+            if [[ -n "$quorum_bin" ]]; then
+              if emit_cmd_timeout 20 "metadata-quorum status" "$quorum_bin" --bootstrap-server "$bootstrap" describe --status; then
+                :
+              else
+                signal KF025 high "metadata quorum status failed"
+              fi
+              emit_cmd_timeout 20 "metadata-quorum replication" "$quorum_bin" --bootstrap-server "$bootstrap" describe --replication || \
+                signal KF025 medium "metadata quorum replication failed"
+            
+              if grep -Eqi 'CurrentVoters|Observer|Lag|LeaderId' "$ARTIFACT_FILE"; then
+                if grep -Eqi 'Lag:[1-9]|Unknown|ERROR' "$ARTIFACT_FILE"; then
+                  signal KF025 medium "quorum lag or voter anomaly in status output"
+                fi
+              fi
+            else
+              signal KF119 low "kafka-metadata-quorum.sh missing"
+            fi
+            
+            if [[ -n "$topics_bin" ]]; then
+              emit_cmd_timeout 30 "topics list" "$topics_bin" --bootstrap-server "$bootstrap" --list || \
+                signal KF015 high "topics --list failed"
+            
+              emit_cmd_timeout 45 "topics describe all" "$topics_bin" --bootstrap-server "$bootstrap" --describe || \
+                signal KF036 medium "topics --describe failed"
+            
+              urp_out=$(mktemp)
+              if timeout 30 "$topics_bin" --bootstrap-server "$bootstrap" --describe --under-replicated-partitions >"$urp_out" 2>&1; then
+                emit "----- under-replicated-partitions -----"
+                cat "$urp_out" >> "$ARTIFACT_FILE"
+                if grep -q "Topic:" "$urp_out"; then
+                  signal KF036 high "under-replicated partitions present"
+                  signal KF039 medium "ISR shrink likely"
+                else
+                  emit "URP_NONE"
+                fi
+              else
+                emit "URP_QUERY_FAIL"
+                cat "$urp_out" >> "$ARTIFACT_FILE" || true
+              fi
+              rm -f "$urp_out"
+            
+              off_out=$(mktemp)
+              if timeout 30 "$topics_bin" --bootstrap-server "$bootstrap" --describe --unavailable-partitions >"$off_out" 2>&1; then
+                emit "----- unavailable-partitions -----"
+                cat "$off_out" >> "$ARTIFACT_FILE"
+                if grep -q "Topic:" "$off_out"; then
+                  signal KF037 high "unavailable/offline partitions present"
+                  signal KF046 high "partitions without leader"
+                else
+                  emit "OFFLINE_NONE"
+                fi
+              else
+                emit "OFFLINE_QUERY_FAIL"
+                cat "$off_out" >> "$ARTIFACT_FILE" || true
+              fi
+              rm -f "$off_out"
+            
+              if [[ -n "$topic_hint" ]]; then
+                emit_cmd_timeout 20 "topic describe ${topic_hint}" "$topics_bin" --bootstrap-server "$bootstrap" --describe --topic "$topic_hint" || \
+                  signal KF050 medium "hint topic ${topic_hint} describe failed"
+              fi
+            else
+              signal KF118 medium "kafka-topics.sh missing"
+            fi
+            
+            if [[ -n "$groups_bin" ]]; then
+              if emit_cmd_timeout 40 "consumer-groups list" "$groups_bin" --bootstrap-server "$bootstrap" --list; then
+                groups=$(timeout 20 "$groups_bin" --bootstrap-server "$bootstrap" --list 2>/dev/null | head -50 || true)
+                if [[ -n "$groups" ]]; then
+                  while IFS= read -r g; do
+                    [[ -z "$g" ]] && continue
+                    emit_cmd_timeout 25 "consumer-group ${g}" "$groups_bin" --bootstrap-server "$bootstrap" --describe --group "$g" || true
+                  done <<<"$groups"
+                  if grep -Eqi 'LAG|STATE' "$ARTIFACT_FILE"; then
+                    if grep -Eqi 'Empty|Dead|PreparingRebalance|CompletingRebalance' "$ARTIFACT_FILE"; then
+                      signal KF061 medium "consumer group rebalance or empty/dead state"
+                    fi
+                    if awk 'tolower($0) ~ /lag/ && $NF ~ /^[0-9]+$/ && $NF+0 > 1000 {found=1} END{exit !found}' "$ARTIFACT_FILE" 2>/dev/null; then
+                      signal KF062 medium "consumer lag observed"
+                    fi
+                  fi
+                else
+                  emit "CONSUMER_GROUPS_NONE"
+                fi
+              else
+                signal KF064 medium "consumer group coordinator query failed"
+              fi
+            fi
+            
+            if [[ -n "$logdirs_bin" ]]; then
+              brokers="${node1}:${kafka_port} ${node2}:${kafka_port} ${node3}:${kafka_port}"
+              emit_cmd_timeout 40 "log-dirs describe" "$logdirs_bin" --bootstrap-server "$bootstrap" --describe --broker-list "$brokers" || \
+                signal KF083 medium "log-dirs describe failed"
+            fi
+            
+            if [[ -n "$configs_bin" ]]; then
+              for bid in 1 2 3; do
+                emit_cmd_timeout 20 "broker ${bid} configs" "$configs_bin" --bootstrap-server "$bootstrap" \
+                  --entity-type brokers --entity-name "$bid" --describe --all || true
+              done
+            fi
+            
+            # Produce/consume probe (best-effort, ignore failure)
+            probe_topic="ts-probe-${run_id}"
+            if [[ -n "$topics_bin" && -n "$producer_bin" && "$cluster_api_ok" -eq 1 ]]; then
+              timeout 20 "$topics_bin" --bootstrap-server "$bootstrap" --create --topic "$probe_topic" \
+                --partitions 1 --replication-factor 3 --if-not-exists >/dev/null 2>&1 || true
+              msg="probe-$(date +%s)"
+              if printf '%s\n' "$msg" | timeout 15 "$producer_bin" --bootstrap-server "$bootstrap" --topic "$probe_topic" \
+                  --request-timeout-ms 10000 >/dev/null 2>&1; then
+                emit "PRODUCE_PROBE_OK topic=${probe_topic}"
+              else
+                emit "PRODUCE_PROBE_FAIL topic=${probe_topic}"
+                signal KF052 high "produce probe failed"
+                signal KF053 medium "possible NotEnoughReplicas / ISR issue"
+              fi
+              if [[ -n "$consumer_bin" ]]; then
+                got=$(timeout 20 "$consumer_bin" --bootstrap-server "$bootstrap" --topic "$probe_topic" \
+                  --from-beginning --max-messages 1 --timeout-ms 12000 2>/dev/null | tail -n1 || true)
+                if [[ -n "$got" ]]; then
+                  emit "CONSUME_PROBE_OK got=${got}"
+                else
+                  emit "CONSUME_PROBE_FAIL"
+                  signal KF038 medium "consume probe got no message"
+                fi
+              fi
+            fi
+            
+            if [[ "$local_api_ok" -eq 0 && "$cluster_api_ok" -eq 0 ]]; then
+              signal KF026 high "both local and cluster API down"
+            fi
+            
+            finish_artifact
+            exit 0
+        job_ip_list:
+          value: "${kafka_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}' '${kafka_verify_topic}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '900'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_converge
+  - id: kafka-ts_config
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 采集配置信息(含min.isr/voters/advertised)
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # K2 配置信息：server.properties、systemd、JVM 环境、Topic 配置、角色/监听
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            kafka_port=${5:-9092}
+            controller_port=${6:-9093}
+            run_id=${7:-manual}
+            conf_file=${8:-/etc/kafka/server.properties}
+            
+            target_ip=$(resolve_local_ip "$node1" "$node2" "$node3")
+            begin_artifact config "$target_ip" "$run_id"
+            
+            emit "collector=config"
+            emit "conf_file=${conf_file}"
+            emit "install_prefix=${KAFKA_INSTALL_PREFIX}"
+            
+            if [[ -f "$conf_file" ]]; then
+              emit "----- ${conf_file} -----"
+              cat "$conf_file" >> "$ARTIFACT_FILE" 2>&1 || emit "READ_FAIL ${conf_file}"
+            else
+              signal KF024 high "server.properties missing ${conf_file}"
+              emit "CONF_MISSING ${conf_file}"
+              # try common locations
+              for alt in /opt/kafka/3.8.1/config/server.properties /opt/kafka/config/kraft/server.properties; do
+                if [[ -f "$alt" ]]; then
+                  emit "----- fallback ${alt} -----"
+                  cat "$alt" >> "$ARTIFACT_FILE"
+                  conf_file=$alt
+                  break
+                fi
+              done
+            fi
+            
+            if [[ -f "$conf_file" ]]; then
+              getp() { awk -F= -v k="$1" '$1==k {print $2; exit}' "$conf_file"; }
+              roles=$(getp process.roles)
+              node_id=$(getp node.id)
+              voters=$(getp controller.quorum.voters)
+              listeners=$(getp listeners)
+              advertised=$(getp advertised.listeners)
+              log_dirs=$(getp log.dirs)
+              rf=$(getp default.replication.factor)
+              min_isr=$(getp min.insync.replicas)
+              auto_create=$(getp auto.create.topics.enable)
+              unclean=$(getp unclean.leader.election.enable)
+              offsets_rf=$(getp offsets.topic.replication.factor)
+            
+              emit "PARSED process.roles=${roles}"
+              emit "PARSED node.id=${node_id}"
+              emit "PARSED controller.quorum.voters=${voters}"
+              emit "PARSED listeners=${listeners}"
+              emit "PARSED advertised.listeners=${advertised}"
+              emit "PARSED log.dirs=${log_dirs}"
+              emit "PARSED default.replication.factor=${rf}"
+              emit "PARSED min.insync.replicas=${min_isr}"
+              emit "PARSED auto.create.topics.enable=${auto_create}"
+              emit "PARSED unclean.leader.election.enable=${unclean}"
+              emit "PARSED offsets.topic.replication.factor=${offsets_rf}"
+            
+              if [[ -n "$min_isr" && -n "$rf" ]]; then
+                if (( min_isr >= rf )); then
+                  signal KF101 high "min.insync.replicas=${min_isr} >= replication.factor=${rf}"
+                fi
+              fi
+              if [[ "$rf" == "1" || "$offsets_rf" == "1" ]]; then
+                signal KF102 medium "replication.factor=1 HA degraded"
+              fi
+              if [[ "$unclean" == "true" ]]; then
+                signal KF106 high "unclean.leader.election.enable=true"
+                signal KF045 medium "unclean leader election allowed"
+              fi
+              if [[ "$auto_create" == "false" ]]; then
+                emit "NOTE auto.create.topics.enable=false"
+              fi
+              if [[ -n "$advertised" && "$advertised" != *"$target_ip"* && "$advertised" != *localhost* ]]; then
+                signal KF078 medium "advertised.listeners may not contain local ip ${target_ip}: ${advertised}"
+              fi
+              if [[ -n "$listeners" && "$listeners" != *"${kafka_port}"* ]]; then
+                signal KF109 high "listeners missing broker port ${kafka_port}"
+              fi
+              if [[ -n "$listeners" && "$listeners" != *"${controller_port}"* ]]; then
+                signal KF109 high "listeners missing controller port ${controller_port}"
+              fi
+              if [[ -n "$voters" ]]; then
+                for ip in "$node1" "$node2" "$node3"; do
+                  if [[ "$voters" != *"$ip"* ]]; then
+                    signal KF033 high "voter list missing ${ip}: ${voters}"
+                  fi
+                done
+              fi
+            fi
+            
+            emit "----- systemd kafka.service -----"
+            if [[ -f /etc/systemd/system/kafka.service ]]; then
+              cat /etc/systemd/system/kafka.service >> "$ARTIFACT_FILE"
+            else
+              emit "UNIT_MISSING /etc/systemd/system/kafka.service"
+            fi
+            if command -v systemctl >/dev/null 2>&1; then
+              emit_cmd "systemctl is-active kafka" systemctl is-active kafka || signal KF015 medium "kafka.service not active"
+              emit_cmd "systemctl show kafka" systemctl show kafka -p ActiveState -p SubState -p Result -p NRestarts -p Environment -p ExecStart -p Restart || true
+            fi
+            
+            emit "----- JVM / env -----"
+            env | grep -E '^(KAFKA_|LOG_DIR|JAVA_|JMX_)' | sort >> "$ARTIFACT_FILE" || true
+            if command -v java >/dev/null 2>&1; then
+              java -version >> "$ARTIFACT_FILE" 2>&1 || true
+            else
+              signal KF024 high "java missing"
+            fi
+            
+            pid=$(pgrep -f 'kafka\.Kafka' | head -1 || true)
+            if [[ -n "$pid" ]]; then
+              emit "KAFKA_PID=${pid}"
+              tr '\0' ' ' < "/proc/${pid}/cmdline" >> "$ARTIFACT_FILE" 2>/dev/null || true
+              emit ""
+              if [[ -r "/proc/${pid}/limits" ]]; then
+                emit "----- /proc/${pid}/limits -----"
+                grep -E 'open files|Max processes|Max address' "/proc/${pid}/limits" >> "$ARTIFACT_FILE" || true
+              fi
+            else
+              signal KF015 high "kafka.Kafka process not found"
+            fi
+            
+            topics_bin=$(kafka_bin kafka-topics.sh || true)
+            configs_bin=$(kafka_bin kafka-configs.sh || true)
+            bootstrap="${node1}:${kafka_port}"
+            if [[ -n "$topics_bin" && -n "$configs_bin" ]]; then
+              topics=$(timeout 20 "$topics_bin" --bootstrap-server "$bootstrap" --list 2>/dev/null | head -30 || true)
+              while IFS= read -r t; do
+                [[ -z "$t" ]] && continue
+                emit_cmd_timeout 15 "topic ${t} configs" "$configs_bin" --bootstrap-server "$bootstrap" \
+                  --entity-type topics --entity-name "$t" --describe || true
+              done <<<"$topics"
+            fi
+            
+            finish_artifact
+            exit 0
+        job_ip_list:
+          value: "${kafka_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_converge
+  - id: kafka-ts_logs
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 过滤日志(场景关键字映射)
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # K3 过滤日志：server/controller/state-change/request/cleaner，按关键字与时间窗抽取
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            _kafka_port=${5:-9092}
+            _controller_port=${6:-9093}
+            run_id=${7:-manual}
+            log_dir=${8:-/var/log/kafka}
+            window_lines=${9:-800}
+            
+            target_ip=$(resolve_local_ip "$node1" "$node2" "$node3")
+            begin_artifact logs "$target_ip" "$run_id"
+            
+            emit "collector=logs"
+            emit "log_dir=${log_dir} window_lines=${window_lines}"
+            
+            if [[ ! -d "$log_dir" ]]; then
+              for alt in "${KAFKA_INSTALL_PREFIX}/logs" /opt/kafka/logs /var/log/kafka; do
+                [[ -d "$alt" ]] && log_dir=$alt && break
+              done
+            fi
+            emit "resolved_log_dir=${log_dir}"
+            
+            if [[ ! -d "$log_dir" ]]; then
+              signal KF118 medium "kafka log dir missing"
+              emit "LOG_DIR_MISSING"
+              finish_artifact
+              exit 0
+            fi
+            
+            emit "----- log dir listing -----"
+            ls -lah "$log_dir" >> "$ARTIFACT_FILE" 2>&1 || true
+            
+            files=(
+              server.log
+              controller.log
+              state-change.log
+              kafka-request.log
+              log-cleaner.log
+              kafka-authorizer.log
+              kafkaServer.out
+            )
+            
+            keyword_map() {
+              local line=$1
+              case "$line" in
+                *OutOfMemoryError*|*"Java heap space"*) echo KF017 high ;;
+                *"GC overhead"*|*Humongous*|*"Full GC"*) echo KF018 medium ;;
+                *"Too many open files"*) echo KF011 high ;;
+                *"No space left"*|*"disk is full"*|*"Insufficient disk"*) echo KF083 high ;;
+                *"Permission denied"*|*"Read-only file system"*) echo KF084 high ;;
+                *UnderReplicated*|*"shrinking ISR"*) echo KF036 high ;;
+                *OfflinePartition*|*"going offline"*) echo KF037 high ;;
+                *NotEnoughReplicas*) echo KF053 high ;;
+                *NotLeaderOrFollower*|*NotLeaderForPartition*) echo KF038 medium ;;
+                *LEADER_NOT_AVAILABLE*|*LeaderNotAvailable*) echo KF038 high ;;
+                *UNKNOWN_TOPIC_OR_PARTITION*) echo KF050 medium ;;
+                *RECORD_TOO_LARGE*|*RecordTooLargeException*) echo KF055 high ;;
+                *Disconnect*|*"Timed out waiting for a node"*) echo KF071 medium ;;
+                *UnknownHostException*|*"Name or service not known"*) echo KF013 high ;;
+                *"Failed to become"*controller*|*"Resigning"*controller*) echo KF025 medium ;;
+                *Corrupt*|*Checksum*|*InvalidRecordException*) echo KF087 high ;;
+                *fsync*|*"Flushing"*slow*) echo KF093 medium ;;
+                *Rebalance*|*PreparingRebalance*|*"member has left"*) echo KF061 medium ;;
+                *OffsetOutOfRange*|*"offset out of range"*) echo KF063 medium ;;
+                *SASL*|*"Authentication failed"*) echo KF094 medium ;;
+                *Unauthorized*|*"not authorized"*) echo KF095 medium ;;
+                *Throttl*) echo KF099 medium ;;
+                *"Cluster ID"*|*clusterId*) echo KF028 medium ;;
+                *"Duplicate broker registration"*) echo KF029 medium ;;
+                *) echo "" ;;
+              esac
+            }
+            
+            scan_file() {
+              local f=$1
+              local path="${log_dir}/${f}"
+              if [[ ! -f "$path" ]]; then
+                emit "LOG_ABSENT ${f}"
+                return 0
+              fi
+              emit "----- ${f} size=$(wc -c < "$path" | tr -d ' ') mtime=$(date -r "$path" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo unknown) -----"
+              emit "----- ${f} ERROR/WARN/FATAL tail -----"
+              grep -E "ERROR|WARN|FATAL|Exception|OutOfMemory|UnderReplicated|Offline|NotEnoughReplicas|Timeout|Disconnect" "$path" \
+                | tail -n "$window_lines" >> "$ARTIFACT_FILE" 2>/dev/null || emit "NO_MATCH ${f}"
+            
+              local hits
+              hits=$(grep -E "ERROR|FATAL|OutOfMemory|UnderReplicated|OfflinePartition|NotEnoughReplicas|No space left|Too many open files" "$path" 2>/dev/null | tail -n 80 || true)
+              while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                mapped=$(keyword_map "$line")
+                if [[ -n "$mapped" ]]; then
+                  # shellcheck disable=SC2086
+                  signal $mapped "${f}: ${line:0:180}"
+                fi
+              done <<<"$hits"
+            }
+            
+            for f in "${files[@]}"; do
+              scan_file "$f"
+            done
+            
+            # rotated logs
+            emit "----- recent rotated logs -----"
+            ls -1t "$log_dir" | head -40 >> "$ARTIFACT_FILE" || true
+            
+            finish_artifact
+            exit 0
+        job_ip_list:
+          value: "${kafka_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}' '${kafka_log_dir}' '${ts_log_window_lines}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_converge
+  - id: kafka-ts_host
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 采集主机与JVM(GC/FD/磁盘/时钟)
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # K4 主机资源：CPU/内存/磁盘/FD/inode/JVM GC/时钟/负载
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            _kafka_port=${5:-9092}
+            _controller_port=${6:-9093}
+            run_id=${7:-manual}
+            data_dir=${8:-/var/lib/kafka/data}
+            
+            target_ip=$(resolve_local_ip "$node1" "$node2" "$node3")
+            begin_artifact host "$target_ip" "$run_id"
+            
+            emit "collector=host"
+            emit "data_dir=${data_dir}"
+            emit "uname=$(uname -a 2>/dev/null || true)"
+            emit "nproc=$(nproc 2>/dev/null || echo unknown)"
+            
+            emit_cmd "uptime" uptime || true
+            emit_cmd "free -h" free -h || true
+            emit_cmd "vmstat 1 5" vmstat 1 5 || true
+            
+            if command -v top >/dev/null 2>&1; then
+              emit_cmd "top snapshot" top -b -n 1 | head -25 || true
+            fi
+            
+            emit "----- cpu /mem from /proc -----"
+            if [[ -r /proc/loadavg ]]; then
+              load=$(awk '{print $1}' /proc/loadavg)
+              emit "load1=${load}"
+              cores=$(nproc 2>/dev/null || echo 1)
+              awk -v l="$load" -v c="$cores" 'BEGIN{if (c>0 && l+0 > c*0.85) exit 0; exit 1}' && \
+                signal KF002 medium "load1=${load} cores=${cores}" || true
+            fi
+            
+            if [[ -r /proc/meminfo ]]; then
+              awk '/MemTotal|MemAvailable|SwapTotal|SwapFree|Cached|Buffers/' /proc/meminfo >> "$ARTIFACT_FILE"
+              avail_pct=$(awk '/MemTotal:/{t=$2} /MemAvailable:/{a=$2} END{if(t>0) printf "%d", a*100/t; else print 100}' /proc/meminfo)
+              emit "mem_available_pct=${avail_pct}"
+              if (( avail_pct <= 15 )); then
+                signal KF004 high "memory available ${avail_pct}%"
+              fi
+              swap_used=$(awk '/SwapTotal:/{t=$2} /SwapFree:/{f=$2} END{print t-f}' /proc/meminfo)
+              if (( swap_used > 1024*1024 )); then
+                signal KF009 medium "swap used ${swap_used} kB"
+              fi
+            fi
+            
+            emit "----- disk -----"
+            df -h >> "$ARTIFACT_FILE" 2>&1 || true
+            df -i >> "$ARTIFACT_FILE" 2>&1 || true
+            if [[ -d "$data_dir" ]]; then
+              emit "----- df data_dir ${data_dir} -----"
+              df -h "$data_dir" >> "$ARTIFACT_FILE" 2>&1 || true
+              used=$(df -P "$data_dir" | awk 'NR==2{gsub("%","",$5); print $5}')
+              if [[ "${used:-0}" =~ ^[0-9]+$ ]] && (( used >= 90 )); then
+                signal KF083 high "log.dirs ${data_dir} used ${used}%"
+              elif [[ "${used:-0}" =~ ^[0-9]+$ ]] && (( used >= 80 )); then
+                signal KF083 medium "log.dirs ${data_dir} used ${used}%"
+              fi
+              inode_used=$(df -iP "$data_dir" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+              if [[ "${inode_used:-0}" =~ ^[0-9]+$ ]] && (( inode_used >= 90 )); then
+                signal KF012 high "inode used ${inode_used}% on ${data_dir}"
+              fi
+            else
+              emit "DATA_DIR_MISSING ${data_dir}"
+            fi
+            
+            if command -v iostat >/dev/null 2>&1; then
+              emit_cmd "iostat -x 1 3" iostat -x 1 3 || true
+              if iostat -x 1 3 2>/dev/null | awk 'NF>10 && $1 !~ /Device|Linux/ && $(NF-1)+0 > 90 {exit 0} END{exit 1}'; then
+                signal KF085 medium "disk util high from iostat"
+              fi
+            else
+              emit "IOSTAT_MISSING"
+              signal KF118 low "iostat missing (degraded host IO view)"
+            fi
+            
+            emit "----- ulimit / fd -----"
+            emit "ulimit_n=$(ulimit -n 2>/dev/null || echo unknown)"
+            nofile=$(ulimit -n 2>/dev/null || echo 0)
+            if [[ "$nofile" =~ ^[0-9]+$ ]] && (( nofile < 65535 )); then
+              signal KF014 medium "ulimit -n=${nofile} < 65535"
+            fi
+            
+            pid=$(pgrep -f 'kafka\.Kafka' | head -1 || true)
+            if [[ -n "$pid" ]]; then
+              emit "KAFKA_PID=${pid}"
+              if [[ -d "/proc/${pid}/fd" ]]; then
+                fd_count=$(ls "/proc/${pid}/fd" 2>/dev/null | wc -l | tr -d ' ')
+                emit "kafka_fd_count=${fd_count}"
+                if (( fd_count > 20000 )); then
+                  signal KF022 medium "kafka fd count ${fd_count}"
+                fi
+              fi
+              if [[ -r "/proc/${pid}/status" ]]; then
+                awk '/VmRSS|VmSize|Threads|FDSize/' "/proc/${pid}/status" >> "$ARTIFACT_FILE"
+                threads=$(awk '/Threads:/{print $2}' "/proc/${pid}/status")
+                emit "kafka_threads=${threads}"
+              fi
+              if command -v jstat >/dev/null 2>&1; then
+                emit_cmd "jstat -gc ${pid}" jstat -gc "$pid" || true
+                emit_cmd "jstat -gccapacity ${pid}" jstat -gccapacity "$pid" || true
+              elif command -v jcmd >/dev/null 2>&1; then
+                emit_cmd_timeout 10 "jcmd GC.heap_info" jcmd "$pid" GC.heap_info || true
+              else
+                emit "JSTAT_JCMD_MISSING"
+                signal KF119 low "jstat/jcmd missing"
+              fi
+              if [[ -r /proc/meminfo ]] && grep -q 'OOM' /var/log/messages 2>/dev/null; then
+                signal KF005 medium "host messages mention OOM"
+              fi
+              dmesg -T 2>/dev/null | grep -iE 'oom|killed process' | tail -5 >> "$ARTIFACT_FILE" || true
+            else
+              signal KF015 high "kafka process absent on host snapshot"
+            fi
+            
+            emit "----- clock -----"
+            date -u +"%Y-%m-%dT%H:%M:%SZ" >> "$ARTIFACT_FILE"
+            if command -v timedatectl >/dev/null 2>&1; then
+              timedatectl >> "$ARTIFACT_FILE" 2>&1 || true
+              if timedatectl 2>/dev/null | grep -qi 'NTP service: inactive\|synchronized: no'; then
+                signal KF010 medium "time not synchronized"
+              fi
+            fi
+            if command -v ntpq >/dev/null 2>&1; then
+              ntpq -p >> "$ARTIFACT_FILE" 2>&1 || true
+            fi
+            
+            emit "----- sysctl highlights -----"
+            sysctl vm.max_map_count vm.swappiness fs.file-max net.core.somaxconn 2>/dev/null >> "$ARTIFACT_FILE" || true
+            
+            finish_artifact
+            exit 0
+        job_ip_list:
+          value: "${kafka_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}' '${kafka_data_dir}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_converge
+  - id: kafka-ts_network
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 采集网络(9092/9093/分区/qdisc/防火墙)
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # K5 主机网络：监听、对等连通、丢包/qdisc、连接数、防火墙、advertised 可达性
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            kafka_port=${5:-9092}
+            controller_port=${6:-9093}
+            run_id=${7:-manual}
+            
+            target_ip=$(resolve_local_ip "$node1" "$node2" "$node3")
+            begin_artifact network "$target_ip" "$run_id"
+            
+            emit "collector=network"
+            emit "ports broker=${kafka_port} controller=${controller_port}"
+            
+            emit "----- ip / routes -----"
+            ip -4 addr >> "$ARTIFACT_FILE" 2>&1 || ifconfig >> "$ARTIFACT_FILE" 2>&1 || true
+            ip route >> "$ARTIFACT_FILE" 2>&1 || true
+            
+            emit "----- listening sockets -----"
+            if command -v ss >/dev/null 2>&1; then
+              ss -lntp >> "$ARTIFACT_FILE" 2>&1 || true
+              ss -s >> "$ARTIFACT_FILE" 2>&1 || true
+              if ! ss -lnt | awk '{print $4}' | grep -q ":${kafka_port}$"; then
+                signal KF071 high "broker port ${kafka_port} not listening"
+                signal KF015 medium "broker may be down (no ${kafka_port})"
+              fi
+              if ! ss -lnt | awk '{print $4}' | grep -q ":${controller_port}$"; then
+                signal KF072 high "controller port ${controller_port} not listening"
+                signal KF025 medium "controller listener down"
+              fi
+              conn9092=$(ss -tn state established "( dport = :${kafka_port} or sport = :${kafka_port} )" 2>/dev/null | wc -l | tr -d ' ')
+              emit "established_9092_lines=${conn9092}"
+              tw=$(ss -tn state time-wait 2>/dev/null | wc -l | tr -d ' ')
+              emit "time_wait_lines=${tw}"
+              if (( tw > 5000 )); then
+                signal KF081 medium "time-wait connections ${tw}"
+              fi
+            else
+              netstat -lntp >> "$ARTIFACT_FILE" 2>&1 || true
+              signal KF118 low "ss missing"
+            fi
+            
+            tcp_probe() {
+              local host=$1 port=$2
+              if timeout 3 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+                emit "TCP_OK ${host}:${port}"
+                return 0
+              fi
+              emit "TCP_FAIL ${host}:${port}"
+              return 1
+            }
+            
+            emit "----- peer connectivity -----"
+            peer_fail=0
+            ctrl_fail=0
+            for ip in "$node1" "$node2" "$node3"; do
+              [[ -z "$ip" ]] && continue
+              if ping -c 2 -W 2 "$ip" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "PING_OK ${ip}"
+              else
+                emit "PING_FAIL ${ip}"
+                signal KF073 medium "icmp fail to ${ip}"
+              fi
+              tcp_probe "$ip" "$kafka_port" || { peer_fail=$((peer_fail + 1)); signal KF071 medium "tcp ${ip}:${kafka_port} fail"; }
+              tcp_probe "$ip" "$controller_port" || { ctrl_fail=$((ctrl_fail + 1)); signal KF072 medium "tcp ${ip}:${controller_port} fail"; }
+            done
+            if (( peer_fail >= 2 )); then
+              signal KF073 high "multiple broker port connectivity failures"
+            fi
+            if (( ctrl_fail >= 2 )); then
+              signal KF026 high "multiple controller port connectivity failures"
+            fi
+            
+            emit "----- tc qdisc -----"
+            if command -v tc >/dev/null 2>&1; then
+              for dev in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$' || echo eth0); do
+                emit "dev=${dev}"
+                tc qdisc show dev "$dev" >> "$ARTIFACT_FILE" 2>&1 || true
+                if tc qdisc show dev "$dev" 2>/dev/null | grep -Eq 'netem|tbf|htb'; then
+                  signal KF075 medium "tc qdisc netem/tbf/htb active on ${dev}"
+                  signal KF076 medium "possible injected delay/loss/rate-limit on ${dev}"
+                fi
+              done
+            else
+              emit "TC_MISSING"
+            fi
+            
+            emit "----- iptables / nft / firewall -----"
+            if command -v iptables >/dev/null 2>&1; then
+              iptables -S | head -80 >> "$ARTIFACT_FILE" 2>&1 || true
+              if iptables -S 2>/dev/null | grep -E 'DROP|REJECT' | grep -E "${kafka_port}|${controller_port}|10\\.10\\.26" >/dev/null; then
+                signal KF079 medium "iptables DROP/REJECT related to kafka ports or lab net"
+              fi
+            fi
+            if command -v nft >/dev/null 2>&1; then
+              nft list ruleset 2>/dev/null | head -60 >> "$ARTIFACT_FILE" || true
+            fi
+            if command -v firewall-cmd >/dev/null 2>&1; then
+              firewall-cmd --list-all >> "$ARTIFACT_FILE" 2>&1 || true
+            fi
+            
+            emit "----- dns / hosts -----"
+            cat /etc/resolv.conf >> "$ARTIFACT_FILE" 2>&1 || true
+            grep -E 'kafka|10.10.26' /etc/hosts >> "$ARTIFACT_FILE" 2>&1 || true
+            for ip in "$node1" "$node2" "$node3"; do
+              getent hosts "$ip" >> "$ARTIFACT_FILE" 2>&1 || true
+            done
+            
+            conf=/etc/kafka/server.properties
+            if [[ -f "$conf" ]]; then
+              advertised=$(awk -F= '$1=="advertised.listeners"{print $2}' "$conf")
+              emit "advertised.listeners=${advertised}"
+              if [[ -n "$advertised" ]]; then
+                echo "$advertised" | tr ',;' '\n' | while IFS= read -r spec; do
+                  hostport=${spec##*://}
+                  host=${hostport%%:*}
+                  port=${hostport##*:}
+                  [[ "$host" == "$hostport" ]] && continue
+                  tcp_probe "$host" "$port" || signal KF078 high "advertised endpoint unreachable ${host}:${port}"
+                done
+              fi
+            fi
+            
+            emit "----- conntrack / somaxconn -----"
+            sysctl net.core.somaxconn net.ipv4.tcp_tw_reuse net.ipv4.ip_local_port_range 2>/dev/null >> "$ARTIFACT_FILE" || true
+            if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
+              emit "nf_conntrack_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count)"
+            fi
+            
+            finish_artifact
+            exit 0
+        job_ip_list:
+          value: "${kafka_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '600'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_converge
+  - id: kafka-ts_converge
+    type: ConvergeGateway
+    name: 采集汇聚
+    next:
+    - kafka-ts_coverage_gw
+  - id: kafka-ts_coverage_gw
+    type: ExclusiveGateway
+    name: 采集覆盖判定
+    conditions:
+    - name: 采集降级
+      evaluate: "${coverage_status} in ['empty','degraded']"
+      next: kafka-ts_clean_degraded
+    - name: 正常清洗
+      evaluate: default
+      next: kafka-ts_clean
+    next:
+    - kafka-ts_clean
+    - kafka-ts_clean_degraded
+  - id: kafka-ts_clean
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 数据清洗与信号映射
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # 数据清洗：汇聚五路采集产物、去重信号、截断噪声、输出 cleaned 报告供 AI 节点使用
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            kafka_port=${5:-9092}
+            controller_port=${6:-9093}
+            run_id=${7:-manual}
+            profile=${8:-v1}
+            
+            target_ip=$(resolve_local_ip "$node1" "$node2" "$node3")
+            base=$(artifact_dir_for "$run_id")
+            mkdir -p "$base"
+            cleaned="${base}/cleaned.txt"
+            signals_all="${base}/signals.tsv"
+            summary="${base}/summary.md"
+            : > "$cleaned"
+            : > "$signals_all"
+            
+            {
+              echo "===== KAFKA_TS cleaned run_id=${run_id} profile=${profile} ts=$(ts_now) node=${target_ip} ====="
+              echo "cluster_nodes=${node1},${node2},${node3}"
+              echo "ports=${kafka_port}/${controller_port}"
+              echo "install_prefix=${KAFKA_INSTALL_PREFIX}"
+              echo
+            } >> "$cleaned"
+            
+            kinds=(metrics config logs host network)
+            found=0
+            missing=()
+            for kind in "${kinds[@]}"; do
+              files=( "${base}/${kind}".*.txt )
+              if [[ -e "${files[0]}" ]]; then
+                found=$((found + 1))
+                echo "----- kind=${kind} files=${#files[@]} -----" >> "$cleaned"
+                for f in "${files[@]}"; do
+                  echo "### file=$(basename "$f") ###" >> "$cleaned"
+                  # cap each artifact to avoid blowing the AI context
+                  tail -n 400 "$f" >> "$cleaned"
+                  echo >> "$cleaned"
+                done
+              else
+                missing+=("$kind")
+                echo "MISSING_KIND ${kind}" >> "$cleaned"
+              fi
+              sigs=( "${base}/${kind}".*.signals )
+              if [[ -e "${sigs[0]}" ]]; then
+                cat "${sigs[@]}" >> "$signals_all"
+              fi
+            done
+            
+            # Dedup signals: id + first note
+            sorted="${base}/signals.uniq.tsv"
+            if [[ -s "$signals_all" ]]; then
+              awk -F'\t' '
+                NF>=3 {
+                  id=$1; sev=$2; note=$3
+                  key=id
+                  if (!(key in seen)) { seen[key]=1; sev_keep[key]=sev; note_keep[key]=note; order[++n]=key }
+                  if (sev=="high") sev_keep[key]="high"
+                }
+                END {
+                  for (i=1;i<=n;i++) {
+                    k=order[i]
+                    print k "\t" sev_keep[k] "\t" note_keep[k]
+                  }
+                }
+              ' "$signals_all" > "$sorted"
+            else
+              : > "$sorted"
+            fi
+            
+            high_n=$(awk -F'\t' '$2=="high"{c++} END{print c+0}' "$sorted")
+            med_n=$(awk -F'\t' '$2=="medium"{c++} END{print c+0}' "$sorted")
+            low_n=$(awk -F'\t' '$2=="low"{c++} END{print c+0}' "$sorted")
+            sig_n=$(wc -l < "$sorted" | tr -d ' ')
+            
+            {
+              echo "----- SIGNAL_SUMMARY count=${sig_n} high=${high_n} medium=${med_n} low=${low_n} -----"
+              if [[ -s "$sorted" ]]; then
+                cat "$sorted"
+              else
+                echo "NO_SIGNALS"
+              fi
+              echo
+              echo "----- COVERAGE kinds_found=${found}/5 missing=${missing[*]:-none} -----"
+            } >> "$cleaned"
+            
+            coverage_status=ok
+            if (( found == 0 )); then
+              coverage_status=empty
+            elif (( found < 3 )); then
+              coverage_status=degraded
+            fi
+            echo "coverage_status=${coverage_status}" >> "$cleaned"
+            
+            # Candidate ranking: high signals first
+            {
+              echo "# Kafka 排障清洗摘要"
+              echo
+              echo "- run_id: \`${run_id}\`"
+              echo "- profile: \`${profile}\`"
+              echo "- 采集覆盖: ${found}/5 (${coverage_status})"
+              echo "- 信号: ${sig_n} (high=${high_n}, medium=${med_n}, low=${low_n})"
+              echo
+              echo "## 优先信号"
+              echo
+              if [[ -s "$sorted" ]]; then
+                echo "| ID | 级别 | 说明 |"
+                echo "|----|------|------|"
+                awk -F'\t' '{printf "| %s | %s | %s |\n", $1, $2, $3}' "$sorted"
+              else
+                echo "无自动信号。请结合原文日志由 AI 做开放式诊断。"
+              fi
+              echo
+              echo "## 缺失采集"
+              echo
+              if ((${#missing[@]})); then
+                printf -- "- %s\n" "${missing[@]}"
+              else
+                echo "- 无"
+              fi
+            } > "$summary"
+            
+            # machine-readable pointer file
+            cat > "${base}/cleaned.meta" <<EOF
+            run_id=${run_id}
+            profile=${profile}
+            coverage_status=${coverage_status}
+            kinds_found=${found}
+            signal_count=${sig_n}
+            high=${high_n}
+            medium=${med_n}
+            low=${low_n}
+            cleaned=${cleaned}
+            summary=${summary}
+            signals=${sorted}
+            EOF
+            
+            echo "###KAFKA_TS_CLEANSED run_id=${run_id} coverage=${coverage_status} signals=${sig_n}###"
+            cat "$summary"
+            echo "###KAFKA_TS_CLEANSED_BODY###"
+            # keep AI payload bounded
+            head -c 180000 "$cleaned"
+            echo
+            echo "###END_KAFKA_TS_CLEANSED###"
+            exit 0
+        job_ip_list:
+          value: "${kafka_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}' 'v2'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '300'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_ai
+  - id: kafka-ts_clean_degraded
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: 降级清洗
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # 数据清洗：汇聚五路采集产物、去重信号、截断噪声、输出 cleaned 报告供 AI 节点使用
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            kafka_port=${5:-9092}
+            controller_port=${6:-9093}
+            run_id=${7:-manual}
+            profile=${8:-v1}
+            
+            target_ip=$(resolve_local_ip "$node1" "$node2" "$node3")
+            base=$(artifact_dir_for "$run_id")
+            mkdir -p "$base"
+            cleaned="${base}/cleaned.txt"
+            signals_all="${base}/signals.tsv"
+            summary="${base}/summary.md"
+            : > "$cleaned"
+            : > "$signals_all"
+            
+            {
+              echo "===== KAFKA_TS cleaned run_id=${run_id} profile=${profile} ts=$(ts_now) node=${target_ip} ====="
+              echo "cluster_nodes=${node1},${node2},${node3}"
+              echo "ports=${kafka_port}/${controller_port}"
+              echo "install_prefix=${KAFKA_INSTALL_PREFIX}"
+              echo
+            } >> "$cleaned"
+            
+            kinds=(metrics config logs host network)
+            found=0
+            missing=()
+            for kind in "${kinds[@]}"; do
+              files=( "${base}/${kind}".*.txt )
+              if [[ -e "${files[0]}" ]]; then
+                found=$((found + 1))
+                echo "----- kind=${kind} files=${#files[@]} -----" >> "$cleaned"
+                for f in "${files[@]}"; do
+                  echo "### file=$(basename "$f") ###" >> "$cleaned"
+                  # cap each artifact to avoid blowing the AI context
+                  tail -n 400 "$f" >> "$cleaned"
+                  echo >> "$cleaned"
+                done
+              else
+                missing+=("$kind")
+                echo "MISSING_KIND ${kind}" >> "$cleaned"
+              fi
+              sigs=( "${base}/${kind}".*.signals )
+              if [[ -e "${sigs[0]}" ]]; then
+                cat "${sigs[@]}" >> "$signals_all"
+              fi
+            done
+            
+            # Dedup signals: id + first note
+            sorted="${base}/signals.uniq.tsv"
+            if [[ -s "$signals_all" ]]; then
+              awk -F'\t' '
+                NF>=3 {
+                  id=$1; sev=$2; note=$3
+                  key=id
+                  if (!(key in seen)) { seen[key]=1; sev_keep[key]=sev; note_keep[key]=note; order[++n]=key }
+                  if (sev=="high") sev_keep[key]="high"
+                }
+                END {
+                  for (i=1;i<=n;i++) {
+                    k=order[i]
+                    print k "\t" sev_keep[k] "\t" note_keep[k]
+                  }
+                }
+              ' "$signals_all" > "$sorted"
+            else
+              : > "$sorted"
+            fi
+            
+            high_n=$(awk -F'\t' '$2=="high"{c++} END{print c+0}' "$sorted")
+            med_n=$(awk -F'\t' '$2=="medium"{c++} END{print c+0}' "$sorted")
+            low_n=$(awk -F'\t' '$2=="low"{c++} END{print c+0}' "$sorted")
+            sig_n=$(wc -l < "$sorted" | tr -d ' ')
+            
+            {
+              echo "----- SIGNAL_SUMMARY count=${sig_n} high=${high_n} medium=${med_n} low=${low_n} -----"
+              if [[ -s "$sorted" ]]; then
+                cat "$sorted"
+              else
+                echo "NO_SIGNALS"
+              fi
+              echo
+              echo "----- COVERAGE kinds_found=${found}/5 missing=${missing[*]:-none} -----"
+            } >> "$cleaned"
+            
+            coverage_status=ok
+            if (( found == 0 )); then
+              coverage_status=empty
+            elif (( found < 3 )); then
+              coverage_status=degraded
+            fi
+            echo "coverage_status=${coverage_status}" >> "$cleaned"
+            
+            # Candidate ranking: high signals first
+            {
+              echo "# Kafka 排障清洗摘要"
+              echo
+              echo "- run_id: \`${run_id}\`"
+              echo "- profile: \`${profile}\`"
+              echo "- 采集覆盖: ${found}/5 (${coverage_status})"
+              echo "- 信号: ${sig_n} (high=${high_n}, medium=${med_n}, low=${low_n})"
+              echo
+              echo "## 优先信号"
+              echo
+              if [[ -s "$sorted" ]]; then
+                echo "| ID | 级别 | 说明 |"
+                echo "|----|------|------|"
+                awk -F'\t' '{printf "| %s | %s | %s |\n", $1, $2, $3}' "$sorted"
+              else
+                echo "无自动信号。请结合原文日志由 AI 做开放式诊断。"
+              fi
+              echo
+              echo "## 缺失采集"
+              echo
+              if ((${#missing[@]})); then
+                printf -- "- %s\n" "${missing[@]}"
+              else
+                echo "- 无"
+              fi
+            } > "$summary"
+            
+            # machine-readable pointer file
+            cat > "${base}/cleaned.meta" <<EOF
+            run_id=${run_id}
+            profile=${profile}
+            coverage_status=${coverage_status}
+            kinds_found=${found}
+            signal_count=${sig_n}
+            high=${high_n}
+            medium=${med_n}
+            low=${low_n}
+            cleaned=${cleaned}
+            summary=${summary}
+            signals=${sorted}
+            EOF
+            
+            echo "###KAFKA_TS_CLEANSED run_id=${run_id} coverage=${coverage_status} signals=${sig_n}###"
+            cat "$summary"
+            echo "###KAFKA_TS_CLEANSED_BODY###"
+            # keep AI payload bounded
+            head -c 180000 "$cleaned"
+            echo
+            echo "###END_KAFKA_TS_CLEANSED###"
+            exit 0
+        job_ip_list:
+          value: "${kafka_node_ips}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}' 'v2-degraded'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '300'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_ai
+  - id: kafka-ts_ai
+    type: ServiceActivity
+    name: 快速执行脚本
+    stage_name: AI诊断分析
+    component:
+      code: job_fast_execute_script
+      version: v1.2
+      data:
+        biz_cc_id:
+          name: 业务
+          value: ''
+          key: "${biz_cc_id}"
+          version: v1.2
+          source_tag: job_fast_execute_script.biz_cc_id
+        job_account:
+          value: root
+        job_content:
+          value: |
+            #!/usr/bin/env bash
+            # Shared helpers for Kafka troubleshooting collectors. Sourced, not executed.
+            # Collectors must not abort the SOPS flow: they always exit 0 and write artifacts.
+            
+            umask 077
+            
+            json_escape() {
+              local s=${1-}
+              s=${s//\\/\\\\}
+              s=${s//\"/\\\"}
+              s=${s//$'\n'/\\n}
+              s=${s//$'\r'/\\r}
+              s=${s//$'\t'/\\t}
+              printf '%s' "$s"
+            }
+            
+            ts_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+            
+            resolve_local_ip() {
+              local node1=$1 node2=$2 node3=$3
+              local local_ips target_ip=""
+              local_ips=$(hostname -I 2>/dev/null || true)
+              for ip in "$node1" "$node2" "$node3"; do
+                [[ " ${local_ips} " == *" ${ip} "* ]] && target_ip=$ip && break
+              done
+              if [[ -z "$target_ip" ]]; then
+                target_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+              fi
+              printf '%s' "${target_ip:-unknown}"
+            }
+            
+            artifact_dir_for() {
+              local run_id=$1
+              local base=${TS_ARTIFACT_DIR:-/tmp/kafka-troubleshoot}
+              printf '%s/%s' "$base" "$run_id"
+            }
+            
+            begin_artifact() {
+              local kind=$1 node=$2 run_id=$3
+              ARTIFACT_KIND=$kind
+              ARTIFACT_NODE=$node
+              ARTIFACT_RUN_ID=$run_id
+              ARTIFACT_DIR=$(artifact_dir_for "$run_id")
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_FILE="${ARTIFACT_DIR}/${kind}.${node}.txt"
+              SIGNAL_FILE="${ARTIFACT_DIR}/${kind}.${node}.signals"
+              : > "$ARTIFACT_FILE"
+              : > "$SIGNAL_FILE"
+              {
+                echo "===== KAFKA_TS artifact=${kind} node=${node} ts=$(ts_now) run_id=${run_id} ====="
+                echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+              } >> "$ARTIFACT_FILE"
+            }
+            
+            emit() {
+              printf '%s\n' "$*" >> "$ARTIFACT_FILE"
+            }
+            
+            emit_cmd() {
+              local title=$1
+              shift
+              emit "----- ${title} -----"
+              if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                emit "CMD_FAIL: ${title} rc=$?"
+                return 1
+              fi
+              return 0
+            }
+            
+            emit_cmd_timeout() {
+              local seconds=$1 title=$2
+              shift 2
+              emit "----- ${title} (timeout ${seconds}s) -----"
+              if command -v timeout >/dev/null 2>&1; then
+                if ! timeout "$seconds" "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL_OR_TIMEOUT: ${title}"
+                  return 1
+                fi
+              else
+                if ! "$@" >> "$ARTIFACT_FILE" 2>&1; then
+                  emit "CMD_FAIL: ${title}"
+                  return 1
+                fi
+              fi
+              return 0
+            }
+            
+            signal() {
+              # signal <id> <severity> <note>
+              printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SIGNAL_FILE"
+              emit "SIGNAL ${1} severity=${2} ${3}"
+            }
+            
+            finish_artifact() {
+              emit "===== END KAFKA_TS artifact=${ARTIFACT_KIND} node=${ARTIFACT_NODE} ====="
+              echo "###KAFKA_TS_ARTIFACT kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE} file=${ARTIFACT_FILE}###"
+              cat "$ARTIFACT_FILE"
+              echo "###KAFKA_TS_SIGNALS kind=${ARTIFACT_KIND} node=${ARTIFACT_NODE}###"
+              cat "$SIGNAL_FILE"
+              echo "###END_KAFKA_TS_ARTIFACT###"
+            }
+            
+            kafka_bin() {
+              local name=$1
+              local prefix=${KAFKA_INSTALL_PREFIX:-/opt/kafka/3.8.1}
+              if [[ -x "${prefix}/bin/${name}" ]]; then
+                printf '%s' "${prefix}/bin/${name}"
+                return 0
+              fi
+              if command -v "$name" >/dev/null 2>&1; then
+                command -v "$name"
+                return 0
+              fi
+              return 1
+            }
+            # AI 诊断节点：读取清洗产物，组装 SRE prompt；若配置了 AI 端点则调用，否则输出启发式诊断 + 完整 prompt
+            set -uo pipefail
+            
+            node1=${1:-}
+            node2=${2:-}
+            node3=${3:-}
+            KAFKA_INSTALL_PREFIX=${4:-/opt/kafka/3.8.1}
+            kafka_port=${5:-9092}
+            _controller_port=${6:-9093}
+            run_id=${7:-manual}
+            profile=${8:-v1}
+            ai_endpoint=${9:-${KAFKA_AI_ENDPOINT:-}}
+            
+            base=$(artifact_dir_for "$run_id")
+            mkdir -p "$base"
+            prompt="${base}/ai_prompt.md"
+            diagnosis="${base}/ai_diagnosis.md"
+            heuristic="${base}/heuristic_diagnosis.md"
+            summary="${base}/summary.md"
+            cleaned="${base}/cleaned.txt"
+            signals="${base}/signals.uniq.tsv"
+            meta="${base}/cleaned.meta"
+            
+            coverage=unknown
+            if [[ -f "$meta" ]]; then
+              coverage=$(awk -F= '$1=="coverage_status"{print $2}' "$meta")
+            fi
+            
+            catalog_hint() {
+              cat <<'EOF'
+            你必须尽量把根因映射到下列 Kafka 故障场景 ID（可多选，按置信度排序）：
+            KF001 基线正常
+            KF002 CPU高压  KF003 CPU尖峰  KF004 内存压力  KF005 OOM killer  KF006 主机重启
+            KF007 多节点CPU  KF009 Swap  KF010 时钟偏移  KF011 FD耗尽  KF012 inode耗尽  KF013 DNS失败  KF014 ulimit过小
+            KF015 Broker进程停止  KF016 SIGSTOP挂起  KF017 JVM OOM  KF018 长GC  KF021 systemd反复重启  KF022 fd泄漏  KF023 错误堆参数  KF024 启动/配置失败
+            KF025 单Controller失联  KF026 法定人数丢失  KF027 元数据损坏  KF028 cluster.id不匹配  KF029 node.id冲突  KF031 Controller选举风暴  KF033 voters不一致
+            KF036 URP  KF037 Offline分区  KF038 Leader不可用  KF039 ISR收缩  KF040 副本落后  KF041 首选副本倾斜  KF043 RF>存活broker  KF044 min.isr>ISR  KF045 unclean leader  KF046 无Leader  KF047 热点分区  KF050 未知Topic  KF051 自动建主题关闭
+            KF052 生产超时  KF053 NotEnoughReplicas  KF055 消息过大  KF056 acks=all阻塞  KF060 ProduceQuota
+            KF061 重平衡风暴  KF062 消费lag  KF063 OffsetOutOfRange  KF064 Coordinator不可用
+            KF071 9092阻断  KF072 9093阻断  KF073 Broker分区  KF074 客户端隔离  KF075 丢包  KF076 延迟抖动  KF077 限速  KF078 advertised错误  KF079 防火墙
+            KF083 磁盘满  KF084 只读权限  KF085 IO饱和  KF087 日志损坏  KF093 fsync超时
+            KF094 SASL失败  KF095 ACL拒绝  KF097 连接打满  KF099 配额
+            KF101 min.isr>=RF  KF102 RF=1  KF106 unclean.enable  KF109 listener错误  KF110 保留过短
+            KF111 磁盘满+CPU  KF112 网络分区+ISR  KF113 Broker停+远端内存  KF114 GC+重平衡  KF115 Controller失联+URP  KF116 IO+生产超时
+            KF117 采集机不通  KF118 采集工具缺失  KF119 JMX/工具不可用  KF120 部分节点采集失败
+            EOF
+            }
+            
+            {
+              echo "# Kafka KRaft 排障 AI Prompt"
+              echo
+              echo "你是资深 Kafka SRE。集群为 **KRaft 三节点（broker+controller 合一）**，默认 RF=3、min.insync.replicas=2，PLAINTEXT 9092 / CONTROLLER 9093。"
+              echo "任务：根据清洗后的采集证据，给出：**根因假设（按置信度）**、**对应场景 ID**、**关键证据**、**影响面**、**立即止损建议**、**验证步骤**、**仍缺的数据**。"
+              echo "不要编造未出现的指标。若采集覆盖不足，明确说降级诊断。"
+              echo
+              catalog_hint
+              echo
+              echo "## 清洗摘要"
+              echo
+              if [[ -f "$summary" ]]; then
+                cat "$summary"
+              else
+                echo "（无 summary，清洗节点可能失败）"
+              fi
+              echo
+              echo "## 去重信号"
+              echo
+              if [[ -s "$signals" ]]; then
+                cat "$signals"
+              else
+                echo "NO_SIGNALS"
+              fi
+              echo
+              echo "## 清洗正文（截断）"
+              echo
+              echo '```'
+              if [[ -f "$cleaned" ]]; then
+                head -c 120000 "$cleaned"
+              else
+                echo "CLEANED_MISSING"
+              fi
+              echo
+              echo '```'
+            } > "$prompt"
+            
+            # Heuristic ranking from signals
+            {
+              echo "# 启发式诊断（规则引擎，供 AI 对照，不替代模型）"
+              echo
+              echo "- coverage: ${coverage}"
+              echo "- profile: ${profile}"
+              echo
+              if [[ ! -s "$signals" ]]; then
+                if [[ "$coverage" == "empty" || "$coverage" == "degraded" ]]; then
+                  echo "## 结论"
+                  echo
+                  echo "采集不足，优先怀疑 **KF117/KF118/KF120**（采集降级），不要过早下 Kafka 内部根因结论。"
+                else
+                  echo "## 结论"
+                  echo
+                  echo "无自动信号。可能为 **KF001 基线正常**，或故障未落入关键字。请 AI 通读日志做开放诊断。"
+                fi
+              else
+                echo "## 信号推导出的候选"
+                echo
+                echo "| 优先级 | 场景 | 依据 |"
+                echo "|--------|------|------|"
+                rank=1
+                while IFS=$'\t' read -r id sev note; do
+                  [[ -z "$id" ]] && continue
+                  printf "| %s | %s (%s) | %s |\n" "$rank" "$id" "$sev" "$note"
+                  rank=$((rank + 1))
+                  if (( rank > 8 )); then
+                    break
+                  fi
+                done < "$signals"
+                echo
+                echo "## 组合规则"
+                echo
+                ids=$(awk -F'\t' '{print $1}' "$signals" | tr '\n' ' ')
+                echo "- 信号集合: ${ids}"
+                if [[ "$ids" == *KF083* && "$ids" == *KF002* ]]; then
+                  echo "- 命中组合 **KF111**（磁盘满+CPU）"
+                fi
+                if [[ "$ids" == *KF073* && ( "$ids" == *KF036* || "$ids" == *KF039* ) ]]; then
+                  echo "- 命中组合 **KF112**（网络分区+ISR）"
+                fi
+                if [[ "$ids" == *KF015* && "$ids" == *KF004* ]]; then
+                  echo "- 命中组合 **KF113**（Broker 停 + 内存压）"
+                fi
+                if [[ "$ids" == *KF018* && "$ids" == *KF061* ]]; then
+                  echo "- 命中组合 **KF114**（GC+重平衡）"
+                fi
+                if [[ "$ids" == *KF025* && "$ids" == *KF036* ]]; then
+                  echo "- 命中组合 **KF115**（Controller 失联+URP）"
+                fi
+                if [[ "$ids" == *KF085* && "$ids" == *KF052* ]]; then
+                  echo "- 命中组合 **KF116**（IO+生产超时）"
+                fi
+                if [[ "$ids" == *KF026* ]]; then
+                  echo "- **P1**：KRaft 法定人数风险，先恢复 Controller 连通与进程，再谈分区副本。"
+                fi
+                if [[ "$ids" == *KF083* ]]; then
+                  echo "- **P1**：log.dirs 空间，先扩容/清日志段，生产会 NotEnoughReplicas 或离线。"
+                fi
+              fi
+              echo
+              echo "## 建议止损检查单"
+              echo
+              echo "1. 三节点 \`systemctl is-active kafka\` 与 \`ss -lnt | grep -E '9092|9093'\`"
+              echo "2. \`kafka-metadata-quorum.sh --bootstrap-server ${node1}:${kafka_port} describe --status\`"
+              echo "3. \`kafka-topics.sh --describe --under-replicated-partitions / --unavailable-partitions\`"
+              echo "4. \`df -h /var/lib/kafka/data\` 与 \`free -h\` / load"
+              echo "5. 最近变更：配置、扩缩容、流量、磁盘、网络策略"
+            } > "$heuristic"
+            
+            ai_status=skipped
+            ai_body=""
+            if [[ -n "$ai_endpoint" ]]; then
+              payload="${base}/ai_request.json"
+              python3 - "$prompt" "$payload" <<'PY' 2>/dev/null || true
+            import json, sys, pathlib
+            prompt = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+            pathlib.Path(sys.argv[2]).write_text(json.dumps({
+                "model": "kafka-sre",
+                "messages": [
+                    {"role": "system", "content": "You are a Kafka SRE. Reply in Chinese markdown."},
+                    {"role": "user", "content": prompt[:180000]},
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            PY
+              if [[ -f "$payload" ]] && command -v curl >/dev/null 2>&1; then
+                if curl -fsS -m 60 -H 'Content-Type: application/json' -d @"$payload" "$ai_endpoint" > "${base}/ai_raw.json" 2>"${base}/ai_curl.err"; then
+                  ai_status=ok
+                  ai_body=$(head -c 80000 "${base}/ai_raw.json")
+                else
+                  ai_status=fail
+                  ai_body=$(head -c 4000 "${base}/ai_curl.err" 2>/dev/null || echo curl_failed)
+                fi
+              else
+                ai_status=no_curl_or_payload
+              fi
+            fi
+            
+            {
+              echo "# Kafka 排障诊断输出"
+              echo
+              echo "- run_id: \`${run_id}\`"
+              echo "- profile: \`${profile}\`"
+              echo "- coverage: \`${coverage}\`"
+              echo "- ai_endpoint_status: \`${ai_status}\`"
+              echo
+              cat "$heuristic"
+              echo
+              echo "## AI 模型输出"
+              echo
+              if [[ "$ai_status" == "ok" ]]; then
+                echo '```'
+                printf '%s\n' "$ai_body"
+                echo '```'
+              else
+                echo "未调用在线模型（status=${ai_status}）。把 \`${prompt}\` 交给 LLM 节点即可。"
+                echo
+                echo "编排侧可将本节点替换为原生 \`ai_diagnose\` 组件，输入文件："
+                echo
+                echo "- prompt: \`${prompt}\`"
+                echo "- cleaned: \`${cleaned}\`"
+              fi
+            } > "$diagnosis"
+            
+            echo "###KAFKA_TS_AI_DIAGNOSIS run_id=${run_id} ai=${ai_status}###"
+            cat "$diagnosis"
+            echo "###END_KAFKA_TS_AI_DIAGNOSIS###"
+            exit 0
+        job_ip_list:
+          value: "${kafka_node1_ip}"
+        job_rolling_config:
+          value:
+            job_rolling_execute: []
+            job_rolling_expression: ''
+            job_rolling_mode: 1
+        job_script_list_general:
+          value: ''
+        job_script_list_public:
+          value: ''
+        job_script_param:
+          value: "'${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${ts_run_id}' 'v2' '${kafka_ai_endpoint}'"
+        job_script_source:
+          value: manual
+        job_script_timeout:
+          value: '300'
+        job_script_type:
+          value: '1'
+        job_success_id:
+          value: ''
+    auto_retry:
+      enable: false
+      times: 1
+      interval: 0
+    ignore_error: true
+    can_retry: true
+    can_skip: false
+    optional: false
+    next:
+    - kafka-ts_end
+  - id: kafka-ts_end
+    type: EmptyEndEvent
+  constants:
+    "${kafka_node1_ip}":
+      name: Kafka节点1 IP
+      value: 10.10.26.144
+      type: input
+      validation: ^[0-9.]+$
+    "${kafka_node2_ip}":
+      name: Kafka节点2 IP
+      value: 10.10.26.145
+      type: input
+      validation: ^[0-9.]+$
+    "${kafka_node3_ip}":
+      name: Kafka节点3 IP
+      value: 10.10.26.146
+      type: input
+      validation: ^[0-9.]+$
+    "${kafka_node_ips}":
+      name: Kafka三节点IP列表
+      value: 10.10.26.144,10.10.26.145,10.10.26.146
+      type: input
+      validation: ^[0-9.,]+$
+    "${kafka_port}":
+      name: Broker服务端口
+      value: 9092
+      type: input
+      validation: ^[0-9]+$
+    "${kafka_controller_port}":
+      name: KRaft Controller端口
+      value: 9093
+      type: input
+      validation: ^[0-9]+$
+    "${kafka_install_prefix}":
+      name: 二进制安装目录
+      value: /opt/kafka/3.8.1
+      type: input
+      validation: ^/.+
+    "${kafka_data_dir}":
+      name: log.dirs数据目录
+      value: /var/lib/kafka/data
+      type: input
+      validation: ^/.+
+    "${kafka_log_dir}":
+      name: Kafka日志目录
+      value: /var/log/kafka
+      type: input
+      validation: ^/.+
+    "${kafka_verify_topic}":
+      name: 探针/验收Topic
+      value: deploy-verify
+      type: input
+      validation: ^[a-zA-Z0-9._-]+$
+    "${ts_run_id}":
+      name: 排障流水号
+      value: manual
+      type: input
+      validation: ^[A-Za-z0-9._-]+$
+    "${ts_log_window_lines}":
+      name: 日志关键字抽取行数
+      value: 800
+      type: input
+      validation: ^[0-9]+$
+    "${ts_profile}":
+      name: 流程版本
+      value: v2
+      type: input
+      validation: ^(v1|v2|v2-degraded)$
+    "${kafka_ai_endpoint}":
+      name: AI诊断HTTP端点(可空)
+      value: 
+      type: input
+      validation: .*
+    "${ts_artifact_dir}":
+      name: 采集产物目录
+      value: /tmp/kafka-troubleshoot
+      type: input
+      validation: ^/.+
