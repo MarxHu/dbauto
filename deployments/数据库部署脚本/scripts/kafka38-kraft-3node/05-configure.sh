@@ -12,6 +12,7 @@ NODE3="${NODE3:?}"
 NODE_IP="${NODE_IP:-$(hostname -I | awk '{print $1}')}"
 REPLICATION_FACTOR="${REPLICATION_FACTOR:-3}"
 MIN_INSYNC_REPLICAS="${MIN_INSYNC_REPLICAS:-2}"
+KAFKA_HEAP_OPTS="${KAFKA_HEAP_OPTS:--Xms1g -Xmx1g}"
 
 CONF_DIR="${CONF_DIR:-/etc/kafka}"
 DATA_DIR="${DATA_DIR:-/var/lib/kafka/data}"
@@ -72,7 +73,7 @@ Type=simple
 User=root
 Group=root
 Environment=LOG_DIR=${LOG_DIR}
-Environment=KAFKA_HEAP_OPTS=-Xms1g -Xmx1g
+Environment=KAFKA_HEAP_OPTS=${KAFKA_HEAP_OPTS}
 ExecStart=${INSTALL_PREFIX}/bin/kafka-server-start.sh ${CONF_DIR}/server.properties
 ExecStop=/bin/kill -TERM \$MAINPID
 Restart=always

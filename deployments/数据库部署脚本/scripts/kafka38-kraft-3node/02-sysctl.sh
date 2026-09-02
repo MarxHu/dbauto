@@ -9,6 +9,7 @@ mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-kafka.conf <<'EOF'
 vm.max_map_count = 262144
 vm.swappiness = 1
+fs.file-max = 1000000
 EOF
 sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-kafka.conf >/dev/null
 

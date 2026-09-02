@@ -3,7 +3,7 @@ schema_version: v1
 meta:
   name: Kafka KRaft三节点高可用部署
   id: kafka38-kraft
-  description: 二进制安装Apache Kafka 3.8.1 KRaft三节点（broker+controller合一），副本因子3，min.insync.replicas=2，适用于生产级HA基线。
+  description: 二进制安装Apache Kafka 3.8.1 KRaft三节点（broker+controller合一），副本因子3，min.insync.replicas=2；经本地模拟验证。
 spec:
   nodes:
   - id: kafka38-kraft_node1
@@ -31,28 +31,38 @@ spec:
             #!/bin/bash
             set -Eeuo pipefail
             umask 077
-            kafka_port="9092"
-            controller_port="9093"
-            nofile_min="65535"
-            java_min_major="17"
-            required_commands="java curl tar sha512sum ss pgrep systemctl hostname"
             node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][环境预检][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][环境预检][$target_ip] $*"; }
             local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
             target_ip=""
             for ip in "$node1" "$node2" "$node3"; do
               [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
             done
             [[ -n "$target_ip" ]] || error "本机IP不在节点列表中: ${node1},${node2},${node3}"
-            error() { echo "[ERROR][环境预检][$target_ip] $*" >&2; exit 1; }
-            info() { echo "[INFO][环境预检][$target_ip] $*"; }
+            kafka_port="9092"
+            controller_port="9093"
+            nofile_min="65535"
+            java_min_major="17"
+            replication_factor=$4
+            min_insync_replicas=$5
+            required_commands="java curl tar sha512sum ss pgrep systemctl hostname"
             [[ $(id -u) -eq 0 ]] || error "必须由root作业账户执行"
+            valid_ip() {
+              local ip=$1 part
+              [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+              IFS=. read -r -a parts <<<"$ip"
+              for part in "${parts[@]}"; do ((part >= 0 && part <= 255)) || return 1; done
+            }
+            for ip in "$node1" "$node2" "$node3"; do valid_ip "$ip" || error "节点IP非法: $ip"; done
+            [[ "$node1" != "$node2" && "$node1" != "$node3" && "$node2" != "$node3" ]] || error "三节点IP必须互不相同"
+            (( replication_factor >= 1 && replication_factor <= 3 )) || error "replication.factor=$replication_factor 应为1-3"
+            (( min_insync_replicas >= 1 && min_insync_replicas < replication_factor )) || error "min.insync.replicas=$min_insync_replicas 必须 < replication.factor=$replication_factor"
             java_major=$(java -version 2>&1 | awk -F '[".]' '/version/ {print $2; exit}')
             [[ -n "$java_major" && "$java_major" -ge "$java_min_major" ]] || error "Java版本不满足 >= $java_min_major"
             read -r -a commands <<<"$required_commands"
             missing_commands=()
-            for command in "${commands[@]}"; do
-              command -v "$command" >/dev/null 2>&1 || missing_commands+=("$command")
-            done
+            for command in "${commands[@]}"; do command -v "$command" >/dev/null 2>&1 || missing_commands+=("$command"); done
             ((${#missing_commands[@]} == 0)) || error "缺少必需命令: ${missing_commands[*]}"
             for port in "$kafka_port" "$controller_port"; do
               ss -lnt | awk '{print $4}' | grep -q ":${port}$" && error "端口 ${port} 已被占用"
@@ -73,7 +83,7 @@ spec:
         job_script_list_public:
           value: ''
         job_script_param:
-          value: '${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}'
+          value: '${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_replication_factor}' '${kafka_min_insync_replicas}'
         job_script_source:
           value: manual
         job_script_timeout:
@@ -114,18 +124,19 @@ spec:
             set -Eeuo pipefail
             umask 077
             node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][内核参数][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][内核参数][$target_ip] $*"; }
             local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
             target_ip=""
             for ip in "$node1" "$node2" "$node3"; do
               [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
             done
             [[ -n "$target_ip" ]] || error "本机IP不在节点列表中: ${node1},${node2},${node3}"
-            error() { echo "[ERROR][内核参数][$target_ip] $*" >&2; exit 1; }
-            info() { echo "[INFO][内核参数][$target_ip] $*"; }
             mkdir -p /etc/sysctl.d
             cat > /etc/sysctl.d/99-kafka.conf <<'EOF'
             vm.max_map_count = 262144
             vm.swappiness = 1
+            fs.file-max = 1000000
             EOF
             sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-kafka.conf >/dev/null
             current=$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)
@@ -184,6 +195,8 @@ spec:
             set -Eeuo pipefail
             umask 077
             node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][防火墙放行][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][防火墙放行][$target_ip] $*"; }
             local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
             target_ip=""
             for ip in "$node1" "$node2" "$node3"; do
@@ -192,8 +205,6 @@ spec:
             [[ -n "$target_ip" ]] || error "本机IP不在节点列表中: ${node1},${node2},${node3}"
             kafka_port=$4
             controller_port=$5
-            error() { echo "[ERROR][防火墙放行][$target_ip] $*" >&2; exit 1; }
-            info() { echo "[INFO][防火墙放行][$target_ip] $*"; }
             open_firewall_port() {
               local port=$1
               if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
@@ -263,6 +274,8 @@ spec:
             set -Eeuo pipefail
             umask 077
             node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][下载解压安装][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][下载解压安装][$target_ip] $*"; }
             local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
             target_ip=""
             for ip in "$node1" "$node2" "$node3"; do
@@ -275,8 +288,6 @@ spec:
             tarball_sha512=$7
             install_prefix=$8
             work_dir="/tmp/kafka-install"
-            error() { echo "[ERROR][下载解压安装][$target_ip] $*" >&2; exit 1; }
-            info() { echo "[INFO][下载解压安装][$target_ip] $*"; }
             if [[ -x "${install_prefix}/bin/kafka-server-start.sh" ]]; then
               info "已安装 ${install_prefix}/bin/kafka-server-start.sh，跳过"
               exit 0
@@ -353,6 +364,8 @@ spec:
             set -Eeuo pipefail
             umask 077
             node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][生成配置与systemd][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][生成配置与systemd][$target_ip] $*"; }
             local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
             target_ip=""
             for ip in "$node1" "$node2" "$node3"; do
@@ -365,11 +378,10 @@ spec:
             controller_port=$7
             replication_factor=$8
             min_insync_replicas=$9
+            kafka_heap_opts=${10}
             conf_dir="/etc/kafka"
             data_dir="/var/lib/kafka/data"
             log_dir="/var/log/kafka"
-            error() { echo "[ERROR][生成配置与systemd][$target_ip] $*" >&2; exit 1; }
-            info() { echo "[INFO][生成配置与systemd][$target_ip] $*"; }
             node_id=""
             case "$target_ip" in
               "$node1") node_id=1 ;;
@@ -418,7 +430,7 @@ spec:
             User=root
             Group=root
             Environment=LOG_DIR=${log_dir}
-            Environment=KAFKA_HEAP_OPTS=-Xms1g -Xmx1g
+            Environment=KAFKA_HEAP_OPTS=${kafka_heap_opts}
             ExecStart=${install_prefix}/bin/kafka-server-start.sh ${conf_dir}/server.properties
             ExecStop=/bin/kill -TERM \$MAINPID
             Restart=always
@@ -443,7 +455,7 @@ spec:
         job_script_list_public:
           value: ''
         job_script_param:
-          value: '${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_version}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${kafka_replication_factor}' '${kafka_min_insync_replicas}'
+          value: '${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_version}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${kafka_replication_factor}' '${kafka_min_insync_replicas}' '${kafka_heap_opts}'
         job_script_source:
           value: manual
         job_script_timeout:
@@ -484,6 +496,8 @@ spec:
             set -Eeuo pipefail
             umask 077
             node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][KRaft存储格式化][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][KRaft存储格式化][$target_ip] $*"; }
             local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
             target_ip=""
             for ip in "$node1" "$node2" "$node3"; do
@@ -493,16 +507,17 @@ spec:
             install_prefix=$4
             cluster_id=$5
             conf_dir="/etc/kafka"
-            error() { echo "[ERROR][KRaft存储格式化][$target_ip] $*" >&2; exit 1; }
-            info() { echo "[INFO][KRaft存储格式化][$target_ip] $*"; }
             storage_sh="${install_prefix}/bin/kafka-storage.sh"
             [[ -x "$storage_sh" ]] || error "缺少 kafka-storage.sh"
             [[ -f "${conf_dir}/server.properties" ]] || error "缺少 ${conf_dir}/server.properties"
-            if "$storage_sh" info -c "${conf_dir}/server.properties" 2>/dev/null | grep -q "already formatted"; then
+            data_dir=$(grep -E '^log\.dirs=' "${conf_dir}/server.properties" | cut -d= -f2- | tr -d ' ')
+            [[ -n "$data_dir" ]] || error "server.properties 缺少 log.dirs"
+            if [[ -f "${data_dir}/meta.properties" ]]; then
               info "存储已格式化，跳过"
               exit 0
             fi
             "$storage_sh" format -t "$cluster_id" -c "${conf_dir}/server.properties" --ignore-formatted
+            [[ -f "${data_dir}/meta.properties" ]] || error "格式化后缺少 meta.properties"
             info "KRaft 存储格式化完成"
         job_ip_list:
           value: "${kafka_node_ips}"
@@ -557,14 +572,14 @@ spec:
             set -Eeuo pipefail
             umask 077
             node1=$1; node2=$2; node3=$3
+            error() { echo "[ERROR][启动kafka][$target_ip] $*" >&2; exit 1; }
+            info() { echo "[INFO][启动kafka][$target_ip] $*"; }
             local_ips=$(hostname -I 2>/dev/null) || error "无法读取本机IP"
             target_ip=""
             for ip in "$node1" "$node2" "$node3"; do
               [[ " $local_ips " == *" $ip "* ]] && target_ip=$ip && break
             done
             [[ -n "$target_ip" ]] || error "本机IP不在节点列表中: ${node1},${node2},${node3}"
-            error() { echo "[ERROR][启动kafka][$target_ip] $*" >&2; exit 1; }
-            info() { echo "[INFO][启动kafka][$target_ip] $*"; }
             systemctl restart kafka
             sleep 5
             systemctl is-active --quiet kafka || error "kafka.service 未 active"
@@ -622,24 +637,38 @@ spec:
             set -Eeuo pipefail
             umask 077
             node1=$1; node2=$2; node3=$3
-            kafka_port=$4
-            wait_timeout_sec=$5
+            install_prefix=$4
+            kafka_port=$5
+            controller_port=$6
+            wait_timeout_sec=$7
+            kafka_broker_api="${install_prefix}/bin/kafka-broker-api-versions.sh"
             error() { echo "[ERROR][等待全部节点就绪] $*" >&2; exit 1; }
             info() { echo "[INFO][等待全部节点就绪] $*"; }
-            wait_node() {
-              local host=$1
+            [[ -x "$kafka_broker_api" ]] || error "缺少 $kafka_broker_api"
+            wait_port() {
+              local host=$1 port=$2
               local deadline=$((SECONDS + wait_timeout_sec))
               while (( SECONDS < deadline )); do
-                if timeout 3 bash -c "echo >/dev/tcp/${host}/${kafka_port}" 2>/dev/null; then
-                  info "${host}:${kafka_port} 端口可达"
-                  return 0
-                fi
+                timeout 3 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null && { info "${host}:${port} 端口可达"; return 0; }
                 sleep 2
               done
-              error "等待 ${host} 超时 (${wait_timeout_sec}s)"
+              error "等待 ${host}:${port} 超时 (${wait_timeout_sec}s)"
+            }
+            wait_broker_api() {
+              local host=$1 bootstrap="${host}:${kafka_port}"
+              local deadline=$((SECONDS + wait_timeout_sec))
+              while (( SECONDS < deadline )); do
+                "$kafka_broker_api" --bootstrap-server "$bootstrap" >/dev/null 2>&1 && { info "${bootstrap} Broker API 就绪"; return 0; }
+                sleep 3
+              done
+              error "等待 ${bootstrap} Broker API 超时 (${wait_timeout_sec}s)"
             }
             for node in "$node1" "$node2" "$node3"; do
-              wait_node "$node"
+              wait_port "$node" "$kafka_port"
+              wait_port "$node" "$controller_port"
+            done
+            for node in "$node1" "$node2" "$node3"; do
+              wait_broker_api "$node"
             done
             info "全部节点已就绪"
         job_ip_list:
@@ -654,7 +683,7 @@ spec:
         job_script_list_public:
           value: ''
         job_script_param:
-          value: '${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_port}' '${kafka_wait_timeout_sec}'
+          value: '${kafka_node1_ip}' '${kafka_node2_ip}' '${kafka_node3_ip}' '${kafka_install_prefix}' '${kafka_port}' '${kafka_controller_port}' '${kafka_wait_timeout_sec}'
         job_script_source:
           value: manual
         job_script_timeout:
@@ -736,7 +765,7 @@ spec:
       times: 1
       interval: 0
     ignore_error: false
-    can_retry: true
+    can_retry: false
     can_skip: false
     optional: false
     next:
@@ -776,11 +805,13 @@ spec:
             info() { echo "[INFO][部署验收] $*"; }
             "$kafka_broker_api" --bootstrap-server "$bootstrap" >/dev/null
             describe=$("$kafka_topics" --bootstrap-server "$bootstrap" --describe --topic "$topic_name")
-            printf '%s\n' "$describe"
+            printf '%s
+            ' "$describe"
             echo "$describe" | grep -q "Topic: ${topic_name}" || error "Topic ${topic_name} 不存在"
             echo "$describe" | grep -q "ReplicationFactor: ${replication_factor}" || error "副本因子不符合期望 ${replication_factor}"
             test_msg="sops-kafka-verify-$(date +%s)"
-            printf '%s\n' "$test_msg" | "$kafka_producer" --bootstrap-server "$bootstrap" --topic "$topic_name" >/dev/null
+            printf '%s
+            ' "$test_msg" | "$kafka_producer" --bootstrap-server "$bootstrap" --topic "$topic_name" >/dev/null
             consumed=$("$kafka_consumer" --bootstrap-server "$bootstrap" --topic "$topic_name" --from-beginning --max-messages 1 --timeout-ms 15000 2>/dev/null | tail -n1)
             [[ "$consumed" == "$test_msg" ]] || error "消费验收失败: got=${consumed}"
             for node in "$node1" "$node2" "$node3"; do
@@ -867,15 +898,15 @@ spec:
       type: input
       validation: ^/.+
     "${kafka_tarball_url}":
-      name: Kafka官方tar.gz下载地址
+      name: Kafka tar.gz下载地址
       value: https://archive.apache.org/dist/kafka/3.8.1/kafka_2.13-3.8.1.tgz
       type: input
       validation: ^https?://.+
     "${kafka_tarball_sha512}":
-      name: Kafka tar.gz SHA512
+      name: Kafka tar.gz SHA512(小写)
       value: b43fada353b7dca51c0f90acf594ec1ce06b2344c046d4059d4deab0615e0e3e76e92eccdbdfa1adad1fbde76c5f25e71acd0db013fb4b1778827448b5285edf
       type: input
-      validation: ^[0-9A-Fa-f]{128}$
+      validation: ^[0-9a-f]{128}$
     "${kafka_cluster_id}":
       name: KRaft集群ID
       value: 4L6g3nShT-eMCtK--X86sw
@@ -891,6 +922,11 @@ spec:
       value: 2
       type: input
       validation: ^[0-9]+$
+    "${kafka_heap_opts}":
+      name: JVM堆内存参数
+      value: -Xms1g -Xmx1g
+      type: input
+      validation: ^-.+
     "${kafka_partitions}":
       name: 验收Topic分区数
       value: 3

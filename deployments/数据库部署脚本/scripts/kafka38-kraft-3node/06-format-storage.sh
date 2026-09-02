@@ -13,10 +13,14 @@ storage_sh="${INSTALL_PREFIX}/bin/kafka-storage.sh"
 [[ -x "${storage_sh}" ]] || error "缺少 kafka-storage.sh"
 [[ -f "${CONF_DIR}/server.properties" ]] || error "缺少 ${CONF_DIR}/server.properties"
 
-if "${storage_sh}" info -c "${CONF_DIR}/server.properties" 2>/dev/null | grep -q "already formatted"; then
-  log "存储已格式化，跳过"
+data_dir="$(grep -E '^log\.dirs=' "${CONF_DIR}/server.properties" | cut -d= -f2- | tr -d ' ')"
+[[ -n "${data_dir}" ]] || error "server.properties 缺少 log.dirs"
+
+if [[ -f "${data_dir}/meta.properties" ]]; then
+  log "存储已格式化 (${data_dir}/meta.properties 存在)，跳过"
   exit 0
 fi
 
 "${storage_sh}" format -t "${CLUSTER_ID}" -c "${CONF_DIR}/server.properties" --ignore-formatted
+[[ -f "${data_dir}/meta.properties" ]] || error "格式化后缺少 meta.properties"
 log "KRaft 存储格式化完成"
