@@ -1,9 +1,11 @@
 # Redis Cluster 故障注入 — 完整说明
 
 > 仓库地址：**https://github.com/MarxHu/dbauto**  
-> 脚本目录：**https://github.com/MarxHu/dbauto/tree/main/redis_fault_injection**
+> 脚本目录：**https://github.com/MarxHu/dbauto/tree/cursor/redis-fault-injection-catalog-eccc/redis_fault_injection**  
+> **全部故障场景清单**：**https://github.com/MarxHu/dbauto/blob/cursor/redis-fault-injection-catalog-eccc/redis_fault_injection/REDIS_FAULT_SCENARIOS.md**
 
-本文档说明：如何获取脚本、如何配置密码、注入 Bot 与排障 Bot 如何协作、**post-check 验收**、以及**每个场景对应的完整命令**。
+本文档说明：如何获取脚本、如何配置密码、注入 Bot 与排障 Bot 如何协作、**post-check 验收**。  
+**每个场景的注入方式与完整命令**见 [`REDIS_FAULT_SCENARIOS.md`](./REDIS_FAULT_SCENARIOS.md)。
 
 ---
 
@@ -55,8 +57,10 @@ cd dbauto/redis_fault_injection
 ```
 redis_fault_injection/
 ├── README.md                 ← 本文档
+├── REDIS_FAULT_SCENARIOS.md  ← 全部故障场景清单（注入方式/脚本/命令）
+├── FAULT_INJECTION_PLAN.md   ← 完整注入方案
 ├── PREREQUISITES.md          ← 环境前提清单
-├── SCENARIOS.md              ← 场景速查表
+├── SCENARIOS.md              ← 场景速查表（精简）
 ├── config.env.example        ← 配置模板（无密码）
 ├── run.sh                    ← 统一入口
 ├── lib/common.sh             ← 公共函数、锁、密码加载
@@ -333,8 +337,11 @@ cp config.env.example config.env
 
 | 文档 | 内容 |
 |---|---|
-| [PREREQUISITES.md](./PREREQUISITES.md) | 环境前提、必装工具、按场景额外条件 |
+| [REDIS_FAULT_SCENARIOS.md](./REDIS_FAULT_SCENARIOS.md) | **全部故障场景**（注入方式、脚本、命令、验收） |
+| [FAULT_INJECTION_PLAN.md](./FAULT_INJECTION_PLAN.md) | 完整方案（拓扑、原则、回归） |
+| [PREREQUISITES.md](./PREREQUISITES.md) | 环境前提、必装工具 |
 | [SCENARIOS.md](./SCENARIOS.md) | 场景速查（精简版） |
+| [lab/NODE_SPEC.md](./lab/NODE_SPEC.md) | 4 节点 Docker 规范 |
 | [config.env.example](./config.env.example) | 配置模板 |
 
 ---
