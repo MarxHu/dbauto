@@ -655,7 +655,8 @@ spec:
               error "等待 ${host}:${port} 超时 (${wait_timeout_sec}s)"
             }
             wait_broker_api() {
-              local host=$1 bootstrap="${host}:${kafka_port}"
+              local host=$1
+              local bootstrap="${host}:${kafka_port}"
               local deadline=$((SECONDS + wait_timeout_sec))
               while (( SECONDS < deadline )); do
                 "$kafka_broker_api" --bootstrap-server "$bootstrap" >/dev/null 2>&1 && { info "${bootstrap} Broker API 就绪"; return 0; }
