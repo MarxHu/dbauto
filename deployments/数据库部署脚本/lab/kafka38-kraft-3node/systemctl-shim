@@ -1,0 +1,84 @@
+#!/bin/bash
+# Minimal systemctl for Docker-as-VM SOPS simulation.
+# Implements the subset used by kafka38-kraft-3node.yaml.
+set -euo pipefail
+
+quiet=0
+args=()
+for a in "$@"; do
+  if [[ "$a" == "--quiet" ]]; then
+    quiet=1
+  else
+    args+=("$a")
+  fi
+done
+
+cmd=${args[0]:-}
+unit=${args[1]:-}
+unit=${unit%.service}
+unit_file="/etc/systemd/system/${unit}.service"
+
+is_kafka_running() {
+  pgrep -f 'kafka\.Kafka' >/dev/null 2>&1
+}
+
+start_from_unit() {
+  local f=$1
+  [[ -f "$f" ]] || { echo "systemctl-shim: unit file not found: $f" >&2; return 1; }
+  local exec_start=""
+  local env_vars=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    if [[ "$line" == Environment=* ]]; then
+      env_vars+=("${line#Environment=}")
+    elif [[ "$line" == ExecStart=* ]]; then
+      exec_start="${line#ExecStart=}"
+    fi
+  done < "$f"
+  [[ -n "$exec_start" ]] || { echo "systemctl-shim: no ExecStart in $f" >&2; return 1; }
+
+  mkdir -p /var/log/kafka /run
+  if is_kafka_running; then
+    pkill -f 'kafka\.Kafka' || true
+    sleep 2
+    pkill -9 -f 'kafka\.Kafka' 2>/dev/null || true
+  fi
+
+  (
+    for ev in "${env_vars[@]}"; do
+      export "${ev?}"
+    done
+    # Word-split ExecStart the same way systemd does for a simple command + args.
+    # shellcheck disable=SC2086
+    exec $exec_start
+  ) >>/var/log/kafka/server.out 2>&1 &
+  echo $! > /run/kafka.pid
+}
+
+case "$cmd" in
+  daemon-reload|enable|disable|is-enabled)
+    exit 0
+    ;;
+  restart|start)
+    start_from_unit "$unit_file"
+    ;;
+  stop)
+    pkill -f 'kafka\.Kafka' || true
+    ;;
+  is-active)
+    if [[ "$unit" == "kafka" ]] && is_kafka_running; then
+      [[ "$quiet" -eq 1 ]] || echo active
+      exit 0
+    fi
+    [[ "$quiet" -eq 1 ]] || echo inactive
+    exit 3
+    ;;
+  "")
+    echo "systemctl-shim: missing command" >&2
+    exit 1
+    ;;
+  *)
+    echo "systemctl-shim: unsupported: $*" >&2
+    exit 1
+    ;;
+esac
