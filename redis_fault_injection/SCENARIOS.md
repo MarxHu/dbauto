@@ -1,5 +1,7 @@
 # Redis Cluster 故障注入场景总表
 
+> **全部场景完整清单（推荐）**：[`REDIS_FAULT_SCENARIOS.md`](./REDIS_FAULT_SCENARIOS.md)  
+> **完整方案**：[`FAULT_INJECTION_PLAN.md`](./FAULT_INJECTION_PLAN.md)  
 > **验收**：仅注入行为（post-check / 持续 / 恢复）。排障链路不在本文。  
 > **模型**：Bot 在 **docker-node**；Redis 在 Docker 容器（模拟 VM，容器内二进制）。  
 > **主机故障**：`docker exec`（`--target-host` IP 或 `--target-container` 名）。  
