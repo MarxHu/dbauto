@@ -1,0 +1,66 @@
+name: kafka-sops-lab
+
+networks:
+  kafka_lab:
+    name: kafka_lab
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      config:
+        - subnet: 10.10.26.0/24
+          gateway: 10.10.26.1
+
+x-kafka-node: &kafka-node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: kafka-sops-lab/vm-node:24.04-jdk17
+  privileged: true
+  cap_add:
+    - NET_ADMIN
+    - SYS_ADMIN
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  mem_limit: 2560m
+  restart: "no"
+  networks:
+    kafka_lab: {}
+
+services:
+  kafka-n1:
+    <<: *kafka-node
+    container_name: kafka-n1
+    hostname: kafka-n1
+    labels:
+      sops.node: "1"
+      sops.ip: "10.10.26.144"
+    networks:
+      kafka_lab:
+        ipv4_address: 10.10.26.144
+
+  kafka-n2:
+    <<: *kafka-node
+    container_name: kafka-n2
+    hostname: kafka-n2
+    labels:
+      sops.node: "2"
+      sops.ip: "10.10.26.145"
+    networks:
+      kafka_lab:
+        ipv4_address: 10.10.26.145
+
+  kafka-n3:
+    <<: *kafka-node
+    container_name: kafka-n3
+    hostname: kafka-n3
+    labels:
+      sops.node: "3"
+      sops.ip: "10.10.26.146"
+    networks:
+      kafka_lab:
+        ipv4_address: 10.10.26.146
