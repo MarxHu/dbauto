@@ -6,11 +6,11 @@ source "${SCRIPT_DIR}/../lib/common.sh"
 
 ACTION=""
 DURATION=""
-MEMORY_NODE="${MEMORY_NODE:-10.10.26.144:6381}"
-MISCONF_NODE="${MISCONF_NODE:-10.10.26.146:6381}"
-STOP_NODE="${STOP_NODE:-10.10.26.144:6381}"
-MEM_NODE="${MEM_NODE:-10.10.26.146:6381}"
-WRITE_NODE="${WRITE_NODE:-10.10.26.144:6381}"
+MEMORY_NODE="${MEMORY_NODE:-10.10.26.144:6379}"
+MISCONF_NODE="${MISCONF_NODE:-10.10.26.146:6379}"
+STOP_NODE="${STOP_NODE:-10.10.26.144:6379}"
+MEM_NODE="${MEM_NODE:-10.10.26.146:6379}"
+WRITE_NODE="${WRITE_NODE:-10.10.26.144:6379}"
 
 usage() {
   usage_header
@@ -30,8 +30,8 @@ Extra options:
 
 Examples:
   $0 --action memory-plus-misconf --duration 240
-  $0 --action write-reject-plus-cpu --write-node 10.10.26.144:6381 --duration 240
-  $0 --action master-stop-plus-memory --stop-node 10.10.26.144:6381 --mem-node 10.10.26.146:6381 --duration 240
+  $0 --action write-reject-plus-cpu --write-node 10.10.26.144:6379 --duration 240
+  $0 --action master-stop-plus-memory --stop-node 10.10.26.144:6379 --mem-node 10.10.26.146:6379 --duration 240
 EOF
 }
 

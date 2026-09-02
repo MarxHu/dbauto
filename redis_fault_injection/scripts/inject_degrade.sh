@@ -7,7 +7,7 @@ source "${SCRIPT_DIR}/../lib/common.sh"
 ACTION=""
 DURATION=""
 BLOCKED_HOST="${BLOCKED_HOST:-10.10.26.146}"
-BLOCKED_PORT="${BLOCKED_PORT:-6381}"
+BLOCKED_PORT="${BLOCKED_PORT:-6379}"
 HIDE_DIR="${HIDE_DIR:-/tmp/redis_fault_hidden_bins}"
 
 usage() {
