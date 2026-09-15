@@ -9,7 +9,7 @@
 
 | 项目 | 说明 |
 |---|---|
-| **交付物（本目录）** | 场景全表 + CLI 契约 + 环境前提；脚本按方案 P0–P3 落地 |
+| **交付物（本目录）** | 场景全表 + `inject_*.sh` + preflight + dry-run 自测 |
 | **验收范围** | 只验收**故障是否被成功注入** |
 | **不包含** | SOPS 排障、五路采集、AI（`troubleshooting/mysql/`） |
 | **运行位置** | 注入 Bot 跑在 **注入机**（Docker 实验室 = `docker-node`） |
@@ -34,7 +34,7 @@ SOPS 交付 IP 为 `172.30.0.11/12/13`，场景 ID 相同，换 `config.env` 即
 
 完整对照表见场景全表第 10 节。
 
-## 3. 怎么用（脚本落地后）
+## 3. 怎么用
 
 ```bash
 cp config.env.example config.env   # 填密码与节点
@@ -45,10 +45,11 @@ cp config.env.example config.env   # 填密码与节点
 
 Bot 解析：`grep INJECT_RESULT` → `status=pass|fail`。
 
-当前仓库 **CLI 已冻结、脚本待 P0 PR**。校验场景 ID 是否自洽：
+无实验室（CI / 本机）：
 
 ```bash
-python3 mysql_fault_injection/tools/validate_catalog.py
+INJECT_DRY_RUN=1 python3 mysql_fault_injection/tools/validate_catalog.py
+INJECT_DRY_RUN=1 bash mysql_fault_injection/tools/test_scripts.sh
 ```
 
 ## 4. 目录
@@ -61,7 +62,10 @@ mysql_fault_injection/
 ├── PREREQUISITES.md
 ├── SCENARIOS.md
 ├── config.env.example
-└── tools/validate_catalog.py
+├── run.sh
+├── lib/common.sh
+├── scripts/inject_*.sh
+└── tools/{validate_catalog.py,test_scripts.sh}
 ```
 
 ## 5. 敏感信息

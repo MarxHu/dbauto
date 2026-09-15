@@ -156,6 +156,38 @@ def main() -> None:
     if "GTID_SUBSET" not in inject:
         errors.append("GTID_SUBSET rule missing")
 
+    scripts_dir = ROOT / "scripts"
+    required_scripts = [
+        "preflight.sh",
+        "inject_host.sh",
+        "inject_mysql.sh",
+        "inject_repl.sh",
+        "inject_network.sh",
+        "inject_disk.sh",
+        "inject_composite.sh",
+        "inject_degrade.sh",
+    ]
+    for name in required_scripts:
+        path = scripts_dir / name
+        if not path.is_file():
+            errors.append(f"missing inject script {name}")
+            continue
+        body = path.read_text(encoding="utf-8")
+        if name != "preflight.sh" and "emit_inject_result" not in body and "inject_pass" not in body:
+            errors.append(f"{name} never emits inject result")
+
+    script_blob = ""
+    if scripts_dir.is_dir():
+        script_blob = "\n".join(p.read_text(encoding="utf-8") for p in scripts_dir.glob("inject_*.sh"))
+    for action in REQUIRED_ACTIONS:
+        if f'"{action}")' not in script_blob and f"{action})" not in script_blob:
+            errors.append(f"CLI action {action!r} not implemented in inject_*.sh")
+
+    if not (ROOT / "lib" / "common.sh").is_file():
+        errors.append("missing lib/common.sh")
+    if not (ROOT / "run.sh").is_file():
+        errors.append("missing run.sh")
+
     n_inject = len(inject_ids)
     n_ts = len(ts_ids)
     print(f"inject_catalog={INJECT_CATALOG.relative_to(ROOT.parent)}")
@@ -165,7 +197,7 @@ def main() -> None:
     if errors:
         fail(errors)
     print("CATALOG_VALIDATE status=pass")
-    print("detail=redis mapping complete, min fault set present, CLI actions frozen")
+    print("detail=redis mapping complete, min fault set present, CLI actions implemented")
 
 
 if __name__ == "__main__":

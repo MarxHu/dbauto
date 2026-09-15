@@ -9,7 +9,7 @@
 本文是 **全部可注入场景** 的单一清单：每个场景怎么注入、打在主还是从、Redis 有没有对应项、post-check、恢复。  
 **验收只看故障是否注入成功**；排障 Bot 独立（五路采集不在本文）。
 
-脚本尚未落地时，下表「脚本 / action」是 **CLI 契约**（与 Redis `inject_*.sh --action` 同形），实现时不得改名。
+脚本已落地：`scripts/inject_*.sh` + `run.sh`。无实验室时可 `INJECT_DRY_RUN=1 ./tools/test_scripts.sh` 做 CLI 自测；真实注入仍需 mysqld 拓扑。
 
 ---
 

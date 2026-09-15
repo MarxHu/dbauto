@@ -13,7 +13,7 @@
 
 | 项 | 约定 |
 |---|---|
-| 交付物 | 场景清单（本 PR）→ Shell 脚本 + preflight + lab 规范（后续 PR） |
+| 交付物 | 场景清单 + Shell 脚本 + preflight + dry-run 自测 |
 | 运行位置 | **注入 Bot 只在注入机**（Docker 实验室 = `docker-node`） |
 | 故障对象 | Docker 容器模拟 VM（容器内 mysqld）；或 SOPS 节点 SSH |
 | 主机类故障 | `docker exec` → 容器（`--target-host` / `--target-container`） |
@@ -72,7 +72,7 @@ datadir 建议 /var/lib/mysql ，非 tmpfs
 
 ---
 
-## 3. 脚本架构（落地时）
+## 3. 脚本架构
 
 | 脚本 | 职责 | Redis 对照 |
 |---|---|---|
@@ -87,7 +87,7 @@ datadir 建议 /var/lib/mysql ，非 tmpfs
 | `lib/common.sh` | 锁、docker exec、mysql 封装、post-check、`INJECT_RESULT` | 同名 |
 | `run.sh` | `./run.sh repl --action stop-sql ...` | 同名 |
 
-本 PR **先冻结 CLI 与场景 ID**，脚本在实验室节点就绪后按第 6 节顺序实现。禁止先写 YAML 再补注入：Kafka v1 的缺口就是「流程有了、定责信号没有」；注入侧同样禁止空壳 action。
+脚本已按冻结的 CLI 落地。无 mysqld 时用 `INJECT_DRY_RUN=1` 跑 `tools/test_scripts.sh`。禁止空壳 action。真实实验室仍按第 6 节顺序做 live 回归。
 
 ---
 
@@ -131,13 +131,13 @@ SELECT SERVICE_STATE FROM performance_schema.replication_applier_status_by_coord
 
 ## 6. 实现顺序
 
-| 批次 | 内容 | 原因 |
+| 批次 | 内容 | 状态 |
 |---|---|---|
-| **本 PR** | 场景全表 + 方案 + 契约 + catalog 校验 | 先对齐 Redis 目录，避免脚本 action 名漂移 |
-| P0 脚本 | preflight、host（cpu/memory/baseline）、mysql process-stop、repl stop-io/stop-sql、disk io-stress、degrade hide-tools | 排障 §14.2 最小故障集 |
-| P1 | 半同步 wait-ack（含 wait_count 分支）、long-trx、packet-loss、repl-block `--scope one\|all` | 一主多从交叉对比 |
-| P2 | binlog-purge / replica-1062（`--confirm YES`）、disk-full、组合 MY196–MY199 | 破坏性放后面 |
-| P3 | freeze、clock-skew、inode、rate-limit、gtid-skip | 增强，非最小集 |
+| 目录 + 脚本 | 全表 + `inject_*.sh` + dry-run 自测 | **已落地** |
+| Live P0 | 实验室跑 preflight、cpu、process-stop、stop-io/stop-sql、io-stress、hide-tools | 待真实 mysqld |
+| Live P1 | 半同步 wait-ack（wait_count 分支）、long-trx、packet-loss、repl-block | 脚本已有，待 live |
+| Live P2 | binlog-purge / replica-1062（`--confirm YES`）、disk-full、组合 | 脚本已有；破坏性，测完重建从库 |
+| Live P3 | freeze、clock-skew、inode、rate-limit、gtid-skip | 脚本已有 |
 
 ---
 
