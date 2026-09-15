@@ -38,10 +38,10 @@ recover_repl_block() {
   if [[ "${SCOPE}" == "all" ]]; then
     for n in ${MYSQL_REPLICAS}; do
       host="${n%%:*}"
-      run_on_host "${host}" "iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP 2>/dev/null || true" || true
+      run_on_host "${host}" "$(priv)iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP 2>/dev/null || true" || true
     done
   else
-    run_on_target "iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP 2>/dev/null || true"
+    run_on_target "$(priv)iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP 2>/dev/null || true"
   fi
 }
 
@@ -50,20 +50,20 @@ recover_partition() {
   for host in "${NODE_A}" "${NODE_B}"; do
     if [[ "${host}" == "${NODE_A}" ]]; then peer="${NODE_B}"; else peer="${NODE_A}"; fi
     run_on_host "${host}" "
-      iptables -D INPUT -s ${peer} -j DROP 2>/dev/null || true
-      iptables -D OUTPUT -d ${peer} -j DROP 2>/dev/null || true
+      $(priv)iptables -D INPUT -s ${peer} -j DROP 2>/dev/null || true
+      $(priv)iptables -D OUTPUT -d ${peer} -j DROP 2>/dev/null || true
     " || true
   done
 }
 
 recover_one_way() {
-  run_on_host "${NODE_A}" "iptables -D INPUT -s ${NODE_B} -j DROP 2>/dev/null || true" || true
+  run_on_host "${NODE_A}" "$(priv)iptables -D INPUT -s ${NODE_B} -j DROP 2>/dev/null || true" || true
 }
 
 recover_client_block() {
   run_on_target "
-    iptables -D INPUT -p tcp --dport ${MYSQL_PORT} -j DROP 2>/dev/null || true
-    iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -j DROP 2>/dev/null || true
+    $(priv)iptables -D INPUT -p tcp --dport ${MYSQL_PORT} -j DROP 2>/dev/null || true
+    $(priv)iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -j DROP 2>/dev/null || true
   "
 }
 
@@ -99,10 +99,10 @@ case "${ACTION}" in
     inject_begin "$([[ "${SCOPE}" == "all" ]] && echo MY190-N || echo MY144)" recover_repl_block
     if [[ "${SCOPE}" == "all" ]]; then
       for n in ${MYSQL_REPLICAS}; do
-        run_on_host "${n%%:*}" "iptables -I OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP"
+        run_on_host "${n%%:*}" "$(priv)iptables -I OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP"
       done
     else
-      run_on_target "iptables -I OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP"
+      run_on_target "$(priv)iptables -I OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP"
     fi
     inject_pass "repl-block scope=${SCOPE} node=${NODE}"
     run_timed_fault "${DURATION}" recover_repl_block
@@ -135,7 +135,7 @@ case "${ACTION}" in
     inject_begin MY144-P recover_partition
     for host in "${NODE_A}" "${NODE_B}"; do
       if [[ "${host}" == "${NODE_A}" ]]; then peer="${NODE_B}"; else peer="${NODE_A}"; fi
-      run_on_host "${host}" "iptables -I INPUT -s ${peer} -j DROP; iptables -I OUTPUT -d ${peer} -j DROP"
+      run_on_host "${host}" "$(priv)iptables -I INPUT -s ${peer} -j DROP; $(priv)iptables -I OUTPUT -d ${peer} -j DROP"
     done
     inject_pass "partition ${NODE_A}<->${NODE_B}"
     run_timed_fault "${DURATION}" recover_partition
@@ -143,14 +143,14 @@ case "${ACTION}" in
   one-way-drop)
     require_all_targets_ok
     inject_begin MY141 recover_one_way
-    run_on_host "${NODE_A}" "iptables -I INPUT -s ${NODE_B} -j DROP"
+    run_on_host "${NODE_A}" "$(priv)iptables -I INPUT -s ${NODE_B} -j DROP"
     inject_pass "one-way drop ${NODE_B}->${NODE_A}"
     run_timed_fault "${DURATION}" recover_one_way
     ;;
   client-block)
     bind_target_from_node "${NODE}"
     inject_begin MY031 recover_client_block
-    run_on_target "iptables -I INPUT -p tcp --dport ${MYSQL_PORT} -j DROP; iptables -I OUTPUT -p tcp --dport ${MYSQL_PORT} -j DROP"
+    run_on_target "$(priv)iptables -I INPUT -p tcp --dport ${MYSQL_PORT} -j DROP; $(priv)iptables -I OUTPUT -p tcp --dport ${MYSQL_PORT} -j DROP"
     inject_pass "blocked ${MYSQL_PORT} on $(target_label)"
     run_timed_fault "${DURATION}" recover_client_block
     ;;

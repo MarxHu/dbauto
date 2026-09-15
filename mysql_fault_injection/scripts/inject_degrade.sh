@@ -23,7 +23,7 @@ EOF
 
 recover_unreach() {
   dry && return 0
-  iptables -D OUTPUT -d "${BLOCKED_HOST}" -p tcp --dport "${BLOCKED_PORT}" -j DROP 2>/dev/null || true
+  injector_iptables -D OUTPUT -d "${BLOCKED_HOST}" -p tcp --dport "${BLOCKED_PORT}" -j DROP 2>/dev/null || true
 }
 
 HIDDEN_DIR="/tmp/mysql_hidden_tools"
@@ -55,7 +55,7 @@ case "${ACTION}" in
     if dry; then
       log "DRY iptables OUTPUT DROP ${BLOCKED_HOST}:${BLOCKED_PORT}"
     else
-      iptables -I OUTPUT -d "${BLOCKED_HOST}" -p tcp --dport "${BLOCKED_PORT}" -j DROP
+      injector_iptables -I OUTPUT -d "${BLOCKED_HOST}" -p tcp --dport "${BLOCKED_PORT}" -j DROP
     fi
     inject_pass "blocked ${BLOCKED_HOST}:${BLOCKED_PORT} from injector"
     run_timed_fault "${DURATION}" recover_unreach

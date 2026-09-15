@@ -28,9 +28,14 @@ TARGET_HOST="${TARGET_HOST:-}"
 TARGET_CONTAINER="${TARGET_CONTAINER:-}"
 FAULT_DURATION_SEC="${FAULT_DURATION_SEC:-600}"
 SSH_USER="${SSH_USER:-root}"
+SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR}"
 NET_DEV="${NET_DEV:-eth0}"
 SEMI_SYNC_WAIT_REPLICA_COUNT="${SEMI_SYNC_WAIT_REPLICA_COUNT:-1}"
 SEMI_SYNC_TIMEOUT_MS="${SEMI_SYNC_TIMEOUT_MS:-10000}"
+MYSQL_CONNECT_TIMEOUT="${MYSQL_CONNECT_TIMEOUT:-5}"
+MYSQL_CLIENT_OPTS="${MYSQL_CLIENT_OPTS:-}"
+FAULT_WAIT_SEC="${FAULT_WAIT_SEC:-60}"
+FAULT_1062_PK="${FAULT_1062_PK:-}"
 
 if [[ "${INJECT_DRY_RUN}" == "1" ]]; then
   INJECT_SKIP_POSTCHECK="${INJECT_SKIP_POSTCHECK:-1}"
@@ -141,6 +146,32 @@ require_target() {
   esac
 }
 
+# Privileged-command prefix for ssh targets when SSH_USER is not root.
+priv() {
+  if [[ "${INJECT_BACKEND}" == "ssh" && "${SSH_USER}" != "root" ]]; then
+    printf 'sudo -n '
+  fi
+}
+
+ssh_cmd() {
+  # -n: do not read stdin (so batch runners / pipes cannot stall SSH).
+  # shellcheck disable=SC2086
+  ssh -n ${SSH_OPTS} "${SSH_USER}@${TARGET_HOST}" "$@"
+}
+
+# iptables on the injector host (MY172). Non-root labs need passwordless sudo -n.
+injector_iptables() {
+  if dry; then
+    log "DRY injector iptables $*"
+    return 0
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    iptables "$@"
+  else
+    sudo -n iptables "$@"
+  fi
+}
+
 run_on_target() {
   local cmd="$1"
   if dry; then
@@ -149,7 +180,7 @@ run_on_target() {
   fi
   case "${INJECT_BACKEND}" in
     docker) ensure_target_container; docker exec "${TARGET_CONTAINER}" bash -lc "${cmd}" ;;
-    ssh) ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${TARGET_HOST}" "${cmd}" ;;
+    ssh) ssh_cmd "${cmd}" ;;
     local) bash -lc "${cmd}" ;;
   esac
 }
@@ -275,8 +306,21 @@ _mysql_mock() {
     *"SEMI_SYNC"*"STATUS"*) echo ON ;;
     *"NO_TX"*) echo 0 ;;
     *"GTID_SUBSET"*) echo 1 ;;
+    *"BINARY LOG STATUS"*|*"MASTER STATUS"*) printf 'mysql-bin.000003\t456\n' ;;
+    *"SHOW TABLES"*) echo pk ;;
+    *"LAST_ERROR_NUMBER"*)
+      if [[ "${sql_u}" == *CONNECTION* ]]; then echo 1236; else echo 1062; fi
+      ;;
     *) echo 0 ;;
   esac
+}
+
+mysql_cli() {
+  local host="$1" port="$2"
+  shift 2
+  # shellcheck disable=SC2086
+  MYSQL_PWD="${MYSQL_PASSWORD}" mysql --protocol=TCP -h "${host}" -P "${port}" -u "${MYSQL_USER}" \
+    --connect-timeout="${MYSQL_CONNECT_TIMEOUT}" --batch --raw ${MYSQL_CLIENT_OPTS} "$@"
 }
 
 mysql_sql() {
@@ -290,8 +334,7 @@ mysql_sql() {
   local host port
   host="${addr%%:*}"
   port="$(node_port "${addr}")"
-  MYSQL_PWD="${MYSQL_PASSWORD}" mysql -h "${host}" -P "${port}" -u "${MYSQL_USER}" \
-    --connect-timeout=5 --batch --raw --skip-column-names -N -e "${sql}" 2>/dev/null
+  mysql_cli "${host}" "${port}" --skip-column-names -N -e "${sql}" 2>/dev/null
 }
 
 mysql_ok() {
@@ -395,6 +438,162 @@ semi_wait_sessions() {
     v="$(mysql_sql "${addr}" "SHOW GLOBAL STATUS LIKE 'Rpl_semi_sync_master_wait_sessions'" 2>/dev/null | awk '{print $NF}' || true)"
   fi
   printf '%s' "${v:-0}"
+}
+
+# SHOW REPLICA STATUS field without \G (batch TSV). Used for Relay_Source / errno fallbacks.
+mysql_repl_field() {
+  local addr="$1" field="$2" host port out
+  if dry; then
+    case "${field}" in
+      Relay_Source_Log_File|Relay_Master_Log_File) printf '%s' "mysql-bin.000001" ;;
+      File) printf '%s' "mysql-bin.000003" ;;
+      Last_IO_Errno) printf '%s' "1236" ;;
+      Last_SQL_Errno) printf '%s' "1062" ;;
+      *) printf '%s' "0" ;;
+    esac
+    return 0
+  fi
+  host="${addr%%:*}"
+  port="$(node_port "${addr}")"
+  out="$(mysql_cli "${host}" "${port}" -e "SHOW REPLICA STATUS" 2>/dev/null \
+    || mysql_cli "${host}" "${port}" -e "SHOW SLAVE STATUS" 2>/dev/null || true)"
+  printf '%s\n' "${out}" | awk -F'\t' -v f="${field}" '
+    NR==1 { for (i=1; i<=NF; i++) if ($i==f) c=i }
+    NR==2 { if (c) print $c }
+  ' | tail -1 | tr -d '\r'
+}
+
+primary_binlog_file() {
+  local p v
+  p="$(primary_node)"
+  if dry; then printf '%s' "mysql-bin.000003"; return 0; fi
+  v="$(mysql_sql "${p}" "SHOW BINARY LOG STATUS" 2>/dev/null | awk '{print $1}' | tail -1 | tr -d '\r' || true)"
+  if [[ -z "${v}" || "${v}" == "0" ]]; then
+    v="$(mysql_sql "${p}" "SHOW MASTER STATUS" 2>/dev/null | awk '{print $1}' | tail -1 | tr -d '\r' || true)"
+  fi
+  printf '%s' "${v}"
+}
+
+binlog_file_num() {
+  local f="${1##*.}"
+  f="${f##*[^0-9]}"
+  printf '%s' "${f:-0}"
+}
+
+# True if file $1 is strictly after $2 (mysql-bin.NNNNNN).
+binlog_file_after() {
+  local a b
+  a="$(binlog_file_num "$1")"
+  b="$(binlog_file_num "$2")"
+  [[ "${a}" =~ ^[0-9]+$ && "${b}" =~ ^[0-9]+$ ]] || return 1
+  (( 10#${a} > 10#${b} ))
+}
+
+last_io_errno() {
+  local addr="$1" v
+  v="$(mysql_sql "${addr}" "SELECT LAST_ERROR_NUMBER FROM performance_schema.replication_connection_status LIMIT 1" 2>/dev/null | tail -1 | tr -d '\r' || true)"
+  v="${v// /}"
+  if [[ -z "${v}" || "${v}" == "0" || "${v}" == "NA" ]]; then
+    local f
+    f="$(mysql_repl_field "${addr}" "Last_IO_Errno" || true)"
+    [[ -n "${f}" ]] && v="${f}"
+  fi
+  printf '%s' "${v:-0}"
+}
+
+last_sql_errno() {
+  local addr="$1" v w
+  v="$(mysql_sql "${addr}" "SELECT LAST_ERROR_NUMBER FROM performance_schema.replication_applier_status_by_coordinator LIMIT 1" 2>/dev/null | tail -1 | tr -d '\r' || true)"
+  v="${v// /}"
+  if [[ -z "${v}" || "${v}" == "0" ]]; then
+    w="$(mysql_sql "${addr}" "SELECT LAST_ERROR_NUMBER FROM performance_schema.replication_applier_status_by_worker LIMIT 1" 2>/dev/null | tail -1 | tr -d '\r' || true)"
+    w="${w// /}"
+    if [[ -n "${w}" && "${w}" != "0" ]]; then
+      v="${w}"
+    fi
+  fi
+  if [[ -z "${v}" || "${v}" == "NA" || "${v}" == "0" ]]; then
+    local f
+    f="$(mysql_repl_field "${addr}" "Last_SQL_Errno" || true)"
+    [[ -n "${f}" ]] && v="${f}"
+  fi
+  printf '%s' "${v:-0}"
+}
+
+relay_source_file() {
+  local addr="$1" v
+  v="$(mysql_repl_field "${addr}" "Relay_Source_Log_File" || true)"
+  if [[ -z "${v}" ]]; then
+    v="$(mysql_repl_field "${addr}" "Relay_Master_Log_File" || true)"
+  fi
+  printf '%s' "${v}"
+}
+
+wait_io_break_or_1236() {
+  local addr="$1" i st err
+  skip_pc && return 0
+  for (( i=0; i<FAULT_WAIT_SEC; i++ )); do
+    err="$(last_io_errno "${addr}")"
+    st="$(io_state "${addr}")"
+    if [[ "${err}" == "1236" || "${st}" != "ON" ]]; then
+      log "POSTCHECK PASS: IO state=${st} Last_IO_Errno=${err} on ${addr}"
+      return 0
+    fi
+    sleep 1
+  done
+  log "POSTCHECK FAIL: IO still ON and Last_IO_Errno!=1236 on ${addr} (got $(last_io_errno "${addr}"))"
+  return 1
+}
+
+wait_sql_errno_1062() {
+  local addr="$1" i err
+  skip_pc && return 0
+  for (( i=0; i<FAULT_WAIT_SEC; i++ )); do
+    err="$(last_sql_errno "${addr}")"
+    if [[ "${err}" == "1062" ]]; then
+      log "POSTCHECK PASS: Last_SQL_Errno=1062 on ${addr}"
+      return 0
+    fi
+    sleep 1
+  done
+  log "POSTCHECK FAIL: Last_SQL_Errno!=1062 on ${addr} (got $(last_sql_errno "${addr}"))"
+  return 1
+}
+
+wait_replica_table() {
+  local addr="$1" db="$2" tbl="$3" i v
+  skip_pc && return 0
+  for (( i=0; i<FAULT_WAIT_SEC; i++ )); do
+    v="$(mysql_sql "${addr}" "SHOW TABLES FROM ${db} LIKE '${tbl}'" 2>/dev/null | tail -1 | tr -d '\r' || true)"
+    if [[ "${v}" == "${tbl}" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# MY011: --vm-bytes 85% follows /proc/meminfo (often the host). Prefer cgroup memory.max.
+start_memory_stress() {
+  local workers="${1:-2}" percent="${2:-85}" duration="${3:-600}"
+  run_on_target "workers=${workers}; percent=${percent}; dur=${duration}; bytes='';
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then
+      max=\$(cat /sys/fs/cgroup/memory.max)
+      if [[ \"\$max\" != max && \"\$max\" -gt 0 ]]; then
+        bytes=\$(( max * percent / 100 ))
+      fi
+    fi
+    if [[ -z \"\$bytes\" && -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+      max=\$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+      if [[ \"\$max\" -gt 0 && \"\$max\" -lt 9223372036854771712 ]]; then
+        bytes=\$(( max * percent / 100 ))
+      fi
+    fi
+    if [[ -n \"\$bytes\" ]]; then
+      nohup stress-ng --vm \${workers} --vm-bytes \${bytes} --vm-keep --timeout \${dur}s >/tmp/mysql_fault_mem.log 2>&1 &
+    else
+      nohup stress-ng --vm \${workers} --vm-bytes \${percent}% --vm-keep --timeout \${dur}s >/tmp/mysql_fault_mem.log 2>&1 &
+    fi"
 }
 
 # --- post-checks -----------------------------------------------------------
@@ -599,7 +798,11 @@ restart_target() {
   if dry; then log "DRY restart $(target_label)"; return 0; fi
   case "${INJECT_BACKEND}" in
     docker) ensure_target_container; log "docker restart ${TARGET_CONTAINER}"; docker restart "${TARGET_CONTAINER}" ;;
-    ssh) run_on_target "reboot" ;;
+    ssh)
+      log "issuing nohup shutdown -r now on ${TARGET_HOST} (SSH drop is success)"
+      ssh_cmd "nohup $(priv)shutdown -r now >/dev/null 2>&1 &" || true
+      return 0
+      ;;
     local) die "reboot not supported on local backend" ;;
   esac
 }

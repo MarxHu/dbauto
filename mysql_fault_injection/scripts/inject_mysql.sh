@@ -126,8 +126,7 @@ case "${ACTION}" in
       (
         end=$((SECONDS + DURATION))
         while (( SECONDS < end )); do
-          MYSQL_PWD="${MYSQL_PASSWORD}" mysql -h "${NODE%%:*}" -P "$(node_port "${NODE}")" -u "${MYSQL_USER}" \
-            -e "SELECT SLEEP(30)" >/dev/null 2>&1 || true
+          mysql_cli "${NODE%%:*}" "$(node_port "${NODE}")" -N -e "SELECT SLEEP(30)" >/dev/null 2>&1 || true
         done
       ) &
       FILL_PID=$!
@@ -194,8 +193,8 @@ case "${ACTION}" in
     if ! dry; then
       pulse_end=$((SECONDS + DURATION))
       while (( SECONDS < pulse_end )); do
-        MYSQL_PWD="wrong-${ERROR_TYPE}" mysql -h "${NODE%%:*}" -P "$(node_port "${NODE}")" -u "${MYSQL_USER}" \
-          --connect-timeout=2 -e "SELECT 1" >/dev/null 2>&1 || true
+        MYSQL_PWD="wrong-${ERROR_TYPE}" mysql --protocol=TCP -h "${NODE%%:*}" -P "$(node_port "${NODE}")" -u "${MYSQL_USER}" \
+          --connect-timeout=2 --batch -e "SELECT 1" >/dev/null 2>&1 || true
         sleep 1
       done
     fi
@@ -205,7 +204,7 @@ case "${ACTION}" in
     require_confirm "oom"
     parse_duration; bind_target_from_node "${NODE}"
     inject_begin MY034 recover_oom
-    run_on_target "nohup stress-ng --vm 4 --vm-bytes 95% --timeout ${DURATION}s >/tmp/mysql_oom.log 2>&1 &"
+    start_memory_stress 4 95 "${DURATION}"
     inject_pass "oom-path vm stress on $(target_label)"
     run_timed_fault "${DURATION}" recover_oom
     ;;
