@@ -93,7 +93,7 @@ case "${ACTION}" in
     acquire_inject_lock; require_target; parse_duration
     inject_begin MY011 recover_memory
     run_on_target "command -v stress-ng >/dev/null" || inject_fail "stress-ng missing in $(target_label)"
-    run_on_target "nohup stress-ng --vm ${MEM_WORKERS} --vm-bytes ${MEM_PERCENT}% --timeout ${DURATION}s >/tmp/mysql_fault_mem.log 2>&1 &"
+    start_memory_stress "${MEM_WORKERS}" "${MEM_PERCENT}" "${DURATION}"
     post_check_memory 15 85 || inject_fail "post-check memory not pressured"
     inject_pass "memory pressured on $(target_label)"
     run_timed_fault "${DURATION}" recover_memory

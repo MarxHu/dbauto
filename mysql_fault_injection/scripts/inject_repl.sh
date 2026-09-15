@@ -94,6 +94,7 @@ recover_source() {
 }
 
 recover_delay() {
+  repl_stop_sql "${NODE}" || true
   mysql_try "${NODE}" "CHANGE REPLICATION SOURCE TO SOURCE_DELAY=0" "CHANGE MASTER TO MASTER_DELAY=0" || true
   repl_start_all "${NODE}" || true
 }
@@ -118,8 +119,8 @@ recover_semi_net() {
   for n in ${MYSQL_REPLICAS}; do
     host="${n%%:*}"
     run_on_host "${host}" "tc qdisc del dev ${NET_DEV} root 2>/dev/null || true
-      iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP 2>/dev/null || true
-      iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP 2>/dev/null || true" || true
+      $(priv)iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP 2>/dev/null || true
+      $(priv)iptables -D OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP 2>/dev/null || true" || true
   done
   recover_semi_vars
 }
@@ -205,12 +206,28 @@ case "${ACTION}" in
     require_replica_node "${NODE}"
     inject_begin MY046 true
     repl_stop_io "${NODE}" || inject_fail "cannot stop IO"
-    mysql_sql "$(primary_node)" "FLUSH BINARY LOGS" >/dev/null || true
-    mysql_sql "$(primary_node)" "FLUSH BINARY LOGS" >/dev/null || true
-    mysql_sql "$(primary_node)" "PURGE BINARY LOGS BEFORE NOW()" >/dev/null \
-      || mysql_sql "$(primary_node)" "PURGE BINARY LOGS TO 'mysql-bin.000001'" >/dev/null || true
+    relay="$(relay_source_file "${NODE}")"
+    relay="${relay:-mysql-bin.000001}"
+    log "replica ${NODE} Relay_Source=${relay}; rotating primary binlogs past it"
+    cur=""
+    for _i in $(seq 1 20); do
+      mysql_sql "$(primary_node)" "FLUSH BINARY LOGS" >/dev/null || true
+      cur="$(primary_binlog_file)"
+      cur="${cur:-mysql-bin.000001}"
+      if binlog_file_after "${cur}" "${relay}"; then
+        break
+      fi
+    done
+    cur="$(primary_binlog_file)"
+    cur="${cur:-mysql-bin.000002}"
+    if ! binlog_file_after "${cur}" "${relay}"; then
+      inject_fail "primary binlog ${cur} did not advance past replica Relay_Source ${relay}"
+    fi
+    mysql_sql "$(primary_node)" "PURGE BINARY LOGS TO '${cur}'" >/dev/null \
+      || inject_fail "PURGE BINARY LOGS TO ${cur} failed"
     repl_start_io "${NODE}" || true
-    inject_pass "purged binlogs while ${NODE} IO was stopped (no auto data repair)"
+    wait_io_break_or_1236 "${NODE}" || inject_fail "expected IO break / errno 1236 after PURGE TO ${cur}"
+    inject_pass "purged binlogs TO ${cur} (replica ${NODE} Relay_Source=${relay}; IO break/1236)"
     ;;
   replica-writable)
     parse_duration
@@ -235,9 +252,15 @@ case "${ACTION}" in
     mysql_sql "${NODE}" "SET GLOBAL read_only=0" >/dev/null
     mysql_sql "$(primary_node)" "CREATE DATABASE IF NOT EXISTS fault_inject" >/dev/null || true
     mysql_sql "$(primary_node)" "CREATE TABLE IF NOT EXISTS fault_inject.pk (id INT PRIMARY KEY)" >/dev/null || true
-    mysql_sql "${NODE}" "INSERT IGNORE INTO fault_inject.pk VALUES (1)" >/dev/null || true
-    mysql_sql "$(primary_node)" "INSERT IGNORE INTO fault_inject.pk VALUES (1)" >/dev/null || true
-    inject_pass "duplicate PK seeded on ${NODE} (SQL should error 1062; no auto data repair)"
+    wait_replica_table "${NODE}" "fault_inject" "pk" \
+      || inject_fail "replica ${NODE} never received fault_inject.pk"
+    pk="${FAULT_1062_PK:-$(date +%s)}"
+    mysql_sql "${NODE}" "INSERT INTO fault_inject.pk VALUES (${pk})" >/dev/null \
+      || inject_fail "cannot seed PK ${pk} on writable replica ${NODE}"
+    mysql_sql "$(primary_node)" "INSERT INTO fault_inject.pk VALUES (${pk})" >/dev/null \
+      || inject_fail "cannot insert same PK ${pk} on primary"
+    wait_sql_errno_1062 "${NODE}" || inject_fail "expected Last_SQL_Errno=1062 on ${NODE}"
+    inject_pass "duplicate PK ${pk} on ${NODE}; Last_SQL_Errno=1062 (no auto data repair)"
     ;;
   dup-server-id)
     require_confirm "dup-server-id"
@@ -311,9 +334,15 @@ case "${ACTION}" in
     parse_duration
     default_one_replica
     inject_begin MY066 recover_delay
-    mysql_try "${NODE}" \
+    repl_stop_sql "${NODE}" || inject_fail "STOP SQL required before SOURCE_DELAY"
+    if ! mysql_try "${NODE}" \
       "CHANGE REPLICATION SOURCE TO SOURCE_DELAY=${DELAY_SEC}" \
-      "CHANGE MASTER TO MASTER_DELAY=${DELAY_SEC}" || inject_fail "SOURCE_DELAY failed"
+      "CHANGE MASTER TO MASTER_DELAY=${DELAY_SEC}"; then
+      repl_stop_all "${NODE}" || true
+      mysql_try "${NODE}" \
+        "CHANGE REPLICATION SOURCE TO SOURCE_DELAY=${DELAY_SEC}" \
+        "CHANGE MASTER TO MASTER_DELAY=${DELAY_SEC}" || inject_fail "SOURCE_DELAY failed"
+    fi
     repl_start_all "${NODE}" || true
     inject_pass "SOURCE_DELAY=${DELAY_SEC} on ${NODE}"
     run_timed_fault "${DURATION}" recover_delay
@@ -322,7 +351,7 @@ case "${ACTION}" in
     parse_duration
     inject_begin MY100 recover_semi_net
     for n in ${MYSQL_REPLICAS}; do
-      run_on_host "${n%%:*}" "iptables -I OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP"
+      run_on_host "${n%%:*}" "$(priv)iptables -I OUTPUT -p tcp --dport ${MYSQL_PORT} -d ${MYSQL_PRIMARY%%:*} -j DROP"
     done
     inject_pass "all replicas blocked from primary:3306 (semi-sync should degrade)"
     run_timed_fault "${DURATION}" recover_semi_net

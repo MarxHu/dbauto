@@ -36,6 +36,16 @@ else
   bad "bot missing mysql client"
 fi
 
+if [[ "$(id -u)" -ne 0 ]]; then
+  if sudo -n iptables -L >/dev/null 2>&1; then
+    ok "sudo -n iptables (MY172 non-root injector)"
+  else
+    warn "injector is non-root; MY172 needs passwordless sudo -n iptables"
+  fi
+else
+  command -v iptables >/dev/null 2>&1 && ok "injector has iptables" || warn "injector missing iptables"
+fi
+
 if [[ -n "${MYSQL_PASSWORD}" ]]; then
   ok "MYSQL_PASSWORD configured"
 else
@@ -92,7 +102,8 @@ elif [[ "${INJECT_BACKEND}" == "ssh" ]]; then
   for node in ${MYSQL_NODES}; do
     host="${node%%:*}"
     TARGET_TOTAL=$((TARGET_TOTAL + 1))
-    if ssh -o BatchMode=yes -o ConnectTimeout=10 "${SSH_USER}@${host}" "echo ok" >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    if ssh -n ${SSH_OPTS} "${SSH_USER}@${host}" "echo ok" >/dev/null 2>&1; then
       ok "SSH ${SSH_USER}@${host}"
       TARGET_OK=$((TARGET_OK + 1))
     else

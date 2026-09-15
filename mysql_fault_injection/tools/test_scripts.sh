@@ -18,7 +18,7 @@ bad() { echo "FAIL: $*"; FAIL=$((FAIL + 1)); }
 echo "=== bash -n ==="
 while IFS= read -r f; do
   bash -n "$f" && ok "syntax $f" || bad "syntax $f"
-done < <(find lib scripts run.sh -type f -name '*.sh' | sort)
+done < <(find lib scripts run.sh tools -type f -name '*.sh' | sort)
 
 echo "=== --help ==="
 for s in scripts/inject_*.sh; do
