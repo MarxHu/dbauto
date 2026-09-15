@@ -1,0 +1,234 @@
+# MySQL 8.4 GTID 一主两从（3 节点）部署流程 — 全新节点版
+#
+# 设计要点：
+# - 确保 /etc/my.cnf 加载 my.cnf.d（8.4 RPM 默认可能无 includedir）
+# - init 配置仅含 GTID/server_id/复制必需项，不含半同步变量
+# - 半同步、从库只读运行时启用（复制就绪后）
+# - 先改密再验收（防 ERROR 1820）
+# - 复制就绪检查用 performance_schema，不用 SHOW REPLICA STATUS\G（防 runner -N 空值）
+# - 建复制含 GET_SOURCE_PUBLIC_KEY=1（防 ERROR 2061）
+
+apiVersion: dbauto/v1
+kind: MySQLClusterDeployment
+metadata:
+  name: mysql84-gtid-primary-replicas-3node-083102
+  mysql_version: "8.4"
+  topology: gtid-primary-replicas
+
+parameters:
+  root_password:
+    description: MySQL root 目标密码（用于替换安装后的临时密码）
+    required: true
+  repl_user:
+    description: 复制账号
+    default: repl
+  repl_password:
+    description: 复制账号密码
+    required: true
+  semi_sync_timeout_ms:
+    description: 主库半同步等待从库 ACK 超时（毫秒）
+    default: 10000
+  semi_sync_wait_replica_count:
+    description: 主库提交事务前至少等待 ACK 的从库数量
+    default: 1
+
+hosts:
+  - ip: 172.30.0.11
+    role: primary
+    server_id: 11
+  - ip: 172.30.0.12
+    role: replica
+    server_id: 12
+  - ip: 172.30.0.13
+    role: replica
+    server_id: 13
+
+phases:
+  - name: 环境预检
+    steps:
+      - action: check_native_mysql_family_conflict
+        description: 检查是否已存在 MySQL/MariaDB/GreatSQL RPM
+        orphan_packages_auto_remove:
+          - mariadb-libs
+        fail_when:
+          - package_has_dependents
+
+  - name: 安装RPM
+    steps:
+      - action: install_mysql_rpm
+        version: "8.4"
+
+  - name: 配置加载与初始化参数
+    description: >
+      8.4 RPM 的 /etc/my.cnf 可能不含 !includedir，必须先补再写 cluster.cnf。
+      init 阶段禁止半同步变量，避免 --initialize 报 unknown variable。
+    steps:
+      - action: ensure_mycnf_includedir
+        file: /etc/my.cnf
+        line: "!includedir /etc/my.cnf.d"
+
+      - action: configure_mysqld
+        when: "host.role == 'primary'"
+        file: /etc/my.cnf.d/mysql-cluster.cnf
+        content: |
+          [mysqld]
+          server-id={{ host.server_id }}
+          gtid_mode=ON
+          enforce_gtid_consistency=ON
+          log_bin=mysql-bin
+          binlog_format=ROW
+          log_replica_updates=ON
+
+      - action: configure_mysqld
+        when: "host.role == 'replica'"
+        file: /etc/my.cnf.d/mysql-cluster.cnf
+        content: |
+          [mysqld]
+          server-id={{ host.server_id }}
+          gtid_mode=ON
+          enforce_gtid_consistency=ON
+          log_replica_updates=ON
+          relay_log=mysql-relay-bin
+          replica_preserve_commit_order=1
+
+  - name: 初始化与启动
+    steps:
+      - action: initialize_mysqld
+        description: 空 datadir 首次初始化（须在 GTID 配置生效后执行）
+      - action: start_mysqld
+        service: mysqld
+
+  - name: 临时密码改密
+    description: >
+      MySQL 8.4 临时密码态仅允许 ALTER USER（ERROR 1820）。
+      此阶段必须早于任何 SELECT/验收语句。
+    auth:
+      user: root
+      password_source: temporary_from_mysqld_log
+    sql:
+      - statement: "ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ params.root_password }}';"
+
+  - name: 启动后验收
+    description: 改密后 fail-fast 验收 GTID 与 server_id，避免建复制时 1777
+    auth:
+      user: root
+      password: "{{ params.root_password }}"
+    checks:
+      - query: "SELECT @@GLOBAL.gtid_mode;"
+        expect: "ON"
+      - query: "SELECT @@GLOBAL.enforce_gtid_consistency;"
+        expect: "ON"
+      - query: "SELECT @@GLOBAL.server_id;"
+        expect: "{{ host.server_id }}"
+
+  - name: 主库创建复制用户
+    when: "host.role == 'primary'"
+    auth:
+      user: root
+      password: "{{ params.root_password }}"
+    sql:
+      - statement: "SET SESSION sql_log_bin = 0;"
+        comment: 初始化语句不写 binlog
+      - statement: "SELECT @@global.gtid_executed;"
+      - statement: "CREATE USER IF NOT EXISTS '{{ params.repl_user }}'@'%' IDENTIFIED BY '{{ params.repl_password }}';"
+      - statement: "GRANT REPLICATION SLAVE ON *.* TO '{{ params.repl_user }}'@'%';"
+      - statement: "FLUSH PRIVILEGES;"
+
+  - name: 从库建立复制
+    when: "host.role == 'replica'"
+    auth:
+      user: root
+      password: "{{ params.root_password }}"
+    sql:
+      - statement: >
+          CHANGE REPLICATION SOURCE TO
+          SOURCE_HOST='172.30.0.11',
+          SOURCE_USER='{{ params.repl_user }}',
+          SOURCE_PASSWORD='{{ params.repl_password }}',
+          SOURCE_AUTO_POSITION=1,
+          GET_SOURCE_PUBLIC_KEY=1;
+        comment: caching_sha2_password 无 SSL 时须 GET_SOURCE_PUBLIC_KEY=1（ERROR 2061）
+      - statement: "START REPLICA;"
+
+  - name: 拓扑保护加固
+    description: >
+      复制就绪后启用半同步与从库只读（运行期，不写 init cnf）。
+      不用 wait_replication + SHOW REPLICA STATUS\G：runner 的 mysql -N
+      会剥掉列名导致 awk 取不到 IO/SQL/behind。改用 performance_schema 单值查询。
+    steps:
+      - action: assert_sql
+        when: "host.role == 'replica'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        checks:
+          - query: "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1;"
+            expect: "ON"
+            comment: 等价 Replica_IO_Running=Yes
+          - query: "SELECT SERVICE_STATE FROM performance_schema.replication_applier_status_by_coordinator LIMIT 1;"
+            expect: "ON"
+            comment: 等价 Replica_SQL_Running=Yes
+          - query: >
+              SELECT GTID_SUBSET(
+                (SELECT RECEIVED_TRANSACTION_SET FROM performance_schema.replication_connection_status LIMIT 1),
+                @@GLOBAL.gtid_executed);
+            expect: "1"
+            comment: >
+              收到的 GTID 必须是 gtid_executed 的子集即可；不能用相等判断。
+              从库 gtid_executed 还含本机 initialize 的 UUID:1，与 RECEIVED 天然不相等。
+
+      - action: run_sql
+        when: "host.role == 'replica'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        sql:
+          - statement: "INSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';"
+            on_error: ignore_if_exists
+          - statement: "SET GLOBAL rpl_semi_sync_replica_enabled = ON;"
+          - statement: "SET GLOBAL read_only = ON;"
+          - statement: "SET GLOBAL super_read_only = ON;"
+
+      - action: run_sql
+        when: "host.role == 'primary'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        sql:
+          - statement: "INSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';"
+            on_error: ignore_if_exists
+          - statement: "SET GLOBAL rpl_semi_sync_source_wait_for_replica_count = {{ params.semi_sync_wait_replica_count }};"
+          - statement: "SET GLOBAL rpl_semi_sync_source_timeout = {{ params.semi_sync_timeout_ms }};"
+          - statement: "SET GLOBAL rpl_semi_sync_source_enabled = ON;"
+
+  - name: 部署验收
+    steps:
+      - action: assert_sql
+        when: "host.role == 'primary'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        checks:
+          - query: "SELECT @@global.gtid_mode;"
+            expect: "ON"
+          - query: "SELECT @@global.rpl_semi_sync_source_enabled;"
+            expect: "ON"
+          - query: "SELECT COUNT(*) FROM performance_schema.replication_connection_status WHERE SERVICE_STATE='ON';"
+            expect: "2"
+
+      - action: assert_sql
+        when: "host.role == 'replica'"
+        auth:
+          user: root
+          password: "{{ params.root_password }}"
+        checks:
+          - query: "SELECT @@global.read_only;"
+            expect: "ON"
+          - query: "SELECT @@global.super_read_only;"
+            expect: "ON"
+          - query: "SELECT @@global.rpl_semi_sync_replica_enabled;"
+            expect: "ON"
+          - query: "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1;"
+            expect: "ON"
+          - query: "SELECT SERVICE_STATE FROM performance_schema.replication_applier_status_by_coordinator LIMIT 1;"
+            expect: "ON"
