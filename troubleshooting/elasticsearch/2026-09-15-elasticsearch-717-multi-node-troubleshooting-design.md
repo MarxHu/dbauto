@@ -31,7 +31,7 @@
 | D13 | 场景 | 瘦 P0；CCR/ILM/snapshot/hot-warm/ingest/安全TLS/混大版本只记 N/A |
 | D14 | AI | **最后一节点**。超时/HTTP/模型异常 → **该节点失败**。不把启发式写成作业成功 |
 | D15 | 可视化 | 清洗节点先写出 Markdown：`summary.md` + `signals.txt`。人看清洗产物；AI 成功则另出诊断 Markdown |
-| D16 | 本次交付 | 只入库本 design.md（及目录 README）。脚本 / SOPS YAML 另开任务 |
+| D16 | 本次交付 | 设计 + 采集/清洗/AI 脚本 + SOPS YAML。故障注入仍不做 |
 
 ---
 
@@ -723,22 +723,24 @@ export EXPECTED_NODES=3
 troubleshooting/elasticsearch/
   2026-09-15-elasticsearch-717-multi-node-troubleshooting-design.md  # 本文
   README.md
-  scripts/                    # 另开任务
+  scripts/                    # 本目录已落地
     _lib.sh
+    es_lib.py
     collect_precheck.sh
     collect_metrics.sh
     collect_status.sh
     collect_config.sh
     collect_logs.sh
     collect_hostnet.sh
-    cleanse.sh
+    cleanse_artifacts.sh
     cleanse_degraded.sh
-    ai_diagnose.sh            # 失败须非 0 退出
+    ai_diagnose.sh
     run_flow.sh
   tools/generate_yaml.py
+  elasticsearch717-troubleshoot.yaml
 ```
 
-**本 PR 不添加 scripts/。** 不添加 `elasticsearch_fault_injection/`。
+**本目录已含 scripts/ 与 SOPS YAML。** 不添加 `elasticsearch_fault_injection/`。
 
 ---
 
