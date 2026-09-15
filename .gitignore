@@ -1,0 +1,7 @@
+# Local injection runtime (passwords, flock state)
+mysql_fault_injection/config.env
+mysql_fault_injection/.state/
+redis_fault_injection/config.env
+redis_fault_injection/.state/
+kafka_fault_injection/config.env
+kafka_fault_injection/.state/
